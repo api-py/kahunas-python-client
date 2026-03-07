@@ -5,7 +5,7 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 ## Features
 
 - **Python Client** — Async HTTP client (`httpx`) with Pydantic v2 models, automatic token refresh, retry logic, and connection resilience
-- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io/) server with **68 tools**, compact JSON payloads, and support for **stdio**, **HTTP/SSE**, and **streamable-http** transports (session-isolated via `contextvars`)
+- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io/) server with **75 tools**, compact JSON payloads, and support for **stdio**, **HTTP/SSE**, and **streamable-http** transports (session-isolated via `contextvars`)
 - **CLI** — Command-line interface with rich terminal output for managing clients, workouts, exercises, and exports
 - **Charts** — Generate PNG progress charts (body weight, body fat, steps, measurements) using `matplotlib`
 - **Calendar Sync** — Sync Kahunas appointments with Google Calendar or Apple Calendar (iCal), with preview/add/remove/sync/trust modes for LLM-driven orchestration
@@ -18,6 +18,7 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 - **Check-in Reminders** — Find overdue clients and send personalised reminders via Kahunas chat and/or WhatsApp
 - **Phone Alignment** — Compare and fix phone numbers between Kahunas client data and WhatsApp E.164 format
 - **Messaging Persona** — Configurable persona template for client communications (default: London-based PT, 15 years experience, British English) — see [`persona.example.txt`](persona.example.txt)
+- **Incremental Data Sync** — Mirror all Kahunas data to a local SQLite database with delta-only synchronisation. Syncs clients, check-ins (with photos), progress metrics, habits, chat messages, workout programs, and exercises. Includes media download tracking for photos and attachments
 - **Docker & Cloud** — Production-ready Dockerfile for Azure Container Instances, AWS Lambda (container), and Kubernetes
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
@@ -89,6 +90,9 @@ export KAHUNAS_PERSONA_TEMPLATE_PATH=""       # Path to template file
 export KAHUNAS_PERSONA_WEIGHT_DEVIATION_PCT="20.0"  # Weight deviation %
 export KAHUNAS_PERSONA_SLEEP_MINIMUM="7.0"          # Sleep threshold
 export KAHUNAS_PERSONA_STEP_MINIMUM="5000"          # Step threshold
+
+# Optional: Incremental Data Sync
+export KAHUNAS_SYNC_DB="~/.kahunas/sync.db"  # SQLite database path
 ```
 
 ### 2. `.env` File
@@ -306,7 +310,7 @@ Connect from an MCP client using the SSE/HTTP endpoint:
 
 ### Available MCP Tools
 
-Once connected, the AI assistant has access to **68 tools** (sorted alphabetically):
+Once connected, the AI assistant has access to **75 tools** (sorted alphabetically):
 
 | Tool | Description |
 |------|-------------|
@@ -323,6 +327,7 @@ Once connected, the AI assistant has access to **68 tools** (sorted alphabetical
 | `delete_checkin` | Delete a client check-in |
 | `detect_client_anomalies` | Scan a client's check-in data for anomalies and threshold breaches |
 | `discover_all_exercises` | Discover and list ALL exercises in the Kahunas exercise library |
+| `download_pending_media` | Download pending photos and attachments tracked by the sync database |
 | `discover_diet_plans` | Discover all diet plans available in Kahunas |
 | `discover_supplement_plans` | Discover all supplement plans available in Kahunas |
 | `export_all_clients` | Export all clients data to Excel |
@@ -338,6 +343,7 @@ Once connected, the AI assistant has access to **68 tools** (sorted alphabetical
 | `generate_chart_from_store` | Generate a PNG chart from locally stored metric data (no API call needed) |
 | `generate_progress_chart` | Generate a PNG chart for weight, body fat, steps, etc. |
 | `get_chat_messages` | Get chat messages with a client |
+| `get_sync_status` | Show the current state of the local SQLite sync database |
 | `get_client` | View, edit, or manage a client |
 | `get_client_progress` | Get body measurement progress data |
 | `get_exercise_progress` | Get exercise strength/volume progress |
@@ -362,6 +368,9 @@ Once connected, the AI assistant has access to **68 tools** (sorted alphabetical
 | `phone_alignment_report` | Show phone alignment between Kahunas client data and WhatsApp E.164 format |
 | `preview_client_message` | Preview what a message to a client would look like |
 | `query_client_metrics` | Query stored metric data from the local timeseries database |
+| `query_local_checkins` | Query check-in data from the local SQLite sync database (no API call) |
+| `query_local_chat` | Query chat messages from the local SQLite sync database (no API call) |
+| `query_local_progress` | Query progress metric data from the local SQLite sync database (no API call) |
 | `remove_client` | Remove a client from Kahunas and/or their calendar appointments |
 | `restore_workout_program` | Restore an archived workout program |
 | `scan_all_client_anomalies` | Scan ALL clients for check-in anomalies and threshold breaches |
@@ -369,8 +378,10 @@ Once connected, the AI assistant has access to **68 tools** (sorted alphabetical
 | `send_chat_message` | Send a Kahunas chat message to a client |
 | `send_checkin_reminders` | Send check-in reminders via Kahunas chat and/or WhatsApp |
 | `store_client_metrics` | Store client metric data points in the local timeseries database |
+| `sync_all_data` | Incrementally sync ALL Kahunas data to a local SQLite database |
 | `sync_appointments_ics` | Generate an iCal (.ics) file for Apple Calendar from Kahunas appointments |
 | `sync_calendar` | Sync Kahunas appointments with Google Calendar or Apple Calendar |
+| `sync_client_data` | Incrementally sync data for a single client to the local SQLite database |
 | `sync_client_metrics` | Fetch client metrics from Kahunas API and store locally |
 | `update_client_phone` | Update a client's phone number in Kahunas |
 | `update_coach_settings` | Update coach configuration settings |
@@ -465,6 +476,26 @@ export_checkin_summary_to_pdf   →  Check-in history with metrics and trends
 export_workout_plan_to_pdf      →  Client's assigned workout plan
 ```
 
+### Incremental Data Sync
+
+Mirror all Kahunas data to a local SQLite database with delta-only synchronisation:
+
+- **9 tables**: clients, check-ins, check-in photos, progress metrics, habits, chat messages, workout programs, exercises, attachments
+- **Delta sync**: Only fetches data that has changed since the last sync
+- **Photo/attachment tracking**: URLs extracted from check-ins and exercises with download status tracking
+- **WAL journal mode**: Safe for concurrent reads during sync
+- **Configurable DB path**: Default `~/.kahunas/sync.db` (or `KAHUNAS_SYNC_DB` env var)
+
+```
+sync_all_data          →  Sync ALL clients, check-ins, progress, habits, chat, programs, exercises
+sync_client_data       →  Sync data for a single client
+get_sync_status        →  Show counts of all synced data and pending downloads
+query_local_checkins   →  Query check-in data offline (no API call)
+query_local_progress   →  Query progress metrics offline (no API call)
+query_local_chat       →  Query chat messages offline (no API call)
+download_pending_media →  Download photos and attachments tracked by the sync
+```
+
 ### Example AI Conversations
 
 > "Show me all my clients and their check-in status"
@@ -490,6 +521,10 @@ export_workout_plan_to_pdf      →  Client's assigned workout plan
 > "Which clients haven't checked in this week? Send them a reminder on WhatsApp"
 
 > "Show me the phone alignment report — fix any mismatched numbers"
+
+> "Sync all my client data locally so I can query it offline"
+
+> "Show me the sync status — how much data do I have locally?"
 
 > "Export Bruce Wayne's check-in summary as a PDF"
 
@@ -675,7 +710,7 @@ src/kahunas_client/
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests (560 tests)
+# Run tests (659 tests)
 pytest tests/ -v
 
 # Run linter
