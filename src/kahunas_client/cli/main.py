@@ -314,12 +314,24 @@ def export_workouts(ctx: click.Context, output: str) -> None:
 
 
 @cli.command("serve")
-def serve() -> None:
-    """Start the MCP server (stdio transport)."""
+@click.option(
+    "--transport",
+    "-t",
+    type=click.Choice(["stdio", "http", "sse", "streamable-http"]),
+    default="stdio",
+    help="MCP transport protocol (default: stdio)",
+)
+@click.option("--host", "-H", default="0.0.0.0", help="Bind address for HTTP transport")
+@click.option("--port", "-p", default=8000, type=int, help="Port for HTTP transport")
+def serve(transport: str, host: str, port: int) -> None:
+    """Start the MCP server."""
     from ..mcp.server import create_server
 
     server = create_server()
-    server.run(transport="stdio")
+    if transport in ("http", "sse", "streamable-http"):
+        server.run(transport=transport, host=host, port=port)
+    else:
+        server.run(transport="stdio")
 
 
 # ── Raw API ──
