@@ -17,6 +17,7 @@ from ..anomaly_detection import parse_thresholds, scan_client_anomalies
 from ..checkin_reminders import build_reminder_message, find_overdue_clients
 from ..client import KahunasClient
 from ..config import KahunasConfig
+from ..data_sync import SyncStore
 from ..metrics_store import (
     MEASUREMENT_SETTINGS,
     MetricsStore,
@@ -49,6 +50,9 @@ _export_var: contextvars.ContextVar[ExportManager | None] = contextvars.ContextV
 _metrics_var: contextvars.ContextVar[MetricsStore | None] = contextvars.ContextVar(
     "_metrics_var", default=None
 )
+_sync_var: contextvars.ContextVar[SyncStore | None] = contextvars.ContextVar(
+    "_sync_var", default=None
+)
 
 # Constants to avoid string duplication (SonarQube S1192)
 _CALENDAR_EVENTS_PATH = "/coach/getCalendarEvents"
@@ -74,6 +78,14 @@ def _get_metrics() -> MetricsStore:
     if store is None:
         store = MetricsStore()
         _metrics_var.set(store)
+    return store
+
+
+def _get_sync() -> SyncStore:
+    store = _sync_var.get()
+    if store is None:
+        store = SyncStore()
+        _sync_var.set(store)
     return store
 
 
@@ -161,6 +173,10 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         if store:
             store.close()
             _metrics_var.set(None)
+        sync = _sync_var.get()
+        if sync:
+            sync.close()
+            _sync_var.set(None)
         return '{"status":"logged_out"}'
 
     # ── Workout Programs ──
@@ -2121,5 +2137,377 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 "message_preview": message,
             }
         )
+
+    # ── Data Sync (SQLite) Tools ──
+
+    @mcp.tool()
+    async def sync_all_data(db_path: str = "") -> str:
+        """Incrementally sync ALL Kahunas data to a local SQLite database.
+
+        Syncs clients, check-ins (with photos), progress metrics, habits,
+        chat messages, workout programs, and exercises. Only fetches data
+        that has changed since the last sync (delta sync).
+
+        Database location: ~/.kahunas/sync.db (configurable via db_path
+        or KAHUNAS_SYNC_DB env var).
+        """
+        client = _get_client()
+        sync = _get_sync() if not db_path else SyncStore(db_path)
+        if db_path:
+            _sync_var.set(sync)
+
+        results: dict[str, Any] = {}
+
+        # 1. Sync clients
+        resp = await client.list_clients()
+        try:
+            clients_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch clients"})
+
+        raw_clients = (
+            clients_data if isinstance(clients_data, list) else clients_data.get("data", [])
+        )
+        results["clients"] = sync.upsert_clients(raw_clients)
+
+        # 2. Per-client data sync
+        checkin_total = 0
+        photo_total = 0
+        progress_total = 0
+        habit_total = 0
+        chat_total = 0
+
+        metrics = ["weight", "bodyfat", "steps", "chest", "waist", "hips", "arms", "thighs"]
+
+        for c in raw_clients:
+            uuid = c.get("uuid", "")
+            if not uuid:
+                continue
+
+            # Check-ins
+            try:
+                ci_resp = await client.list_client_checkins(uuid)
+                ci_data = ci_resp.json()
+                checkins: list[dict[str, Any]] = []
+                if isinstance(ci_data, dict):
+                    checkins = ci_data.get(
+                        "checkins", ci_data.get("check_ins", ci_data.get("data", []))
+                    )
+                    if isinstance(checkins, dict):
+                        checkins = checkins.get("checkins", checkins.get("check_ins", []))
+                elif isinstance(ci_data, list):
+                    checkins = ci_data
+                if checkins:
+                    ci_result = await asyncio.to_thread(sync.upsert_checkins, uuid, checkins)
+                    checkin_total += ci_result["checkins"]
+                    photo_total += ci_result["photos"]
+            except Exception:
+                logger.debug("Could not sync check-ins for %s", uuid)
+
+            # Progress metrics
+            for metric in metrics:
+                try:
+                    p_resp = await client.get_chart_data(uuid, value=metric, range_type="all")
+                    p_data: list[dict[str, Any]] = []
+                    try:
+                        raw = p_resp.json()
+                        if isinstance(raw, list):
+                            p_data = raw
+                        elif isinstance(raw, dict):
+                            p_data = raw.get("data", raw.get("chart_data", []))
+                            if isinstance(p_data, dict):
+                                p_data = []
+                    except Exception:
+                        pass
+                    if p_data:
+                        progress_total += await asyncio.to_thread(
+                            sync.upsert_progress, uuid, metric, p_data
+                        )
+                except Exception:
+                    logger.debug("Could not sync %s for %s", metric, uuid)
+
+            # Habits
+            try:
+                h_resp = await client.list_habits(uuid)
+                h_data = h_resp.json()
+                habits = h_data.get("habits", h_data.get("data", []))
+                if isinstance(habits, list) and habits:
+                    habit_total += await asyncio.to_thread(sync.upsert_habits, uuid, habits)
+            except Exception:
+                logger.debug("Could not sync habits for %s", uuid)
+
+            # Chat messages
+            try:
+                ch_resp = await client.get_chat_messages(uuid)
+                ch_data = ch_resp.json()
+                messages = ch_data.get("messages", ch_data.get("data", []))
+                if isinstance(messages, list) and messages:
+                    chat_total += await asyncio.to_thread(sync.upsert_chat_messages, uuid, messages)
+            except Exception:
+                logger.debug("Could not sync chat for %s", uuid)
+
+        results["checkins"] = checkin_total
+        results["photos_tracked"] = photo_total
+        results["progress_points"] = progress_total
+        results["habits"] = habit_total
+        results["chat_messages"] = chat_total
+
+        # 3. Workout programs
+        try:
+            page = 1
+            program_total = 0
+            while True:
+                programs = await client.list_workout_programs(page, 50)
+                for p in programs.workout_plan:
+                    prog_data = p.model_dump()
+                    if await asyncio.to_thread(sync.upsert_workout_program, prog_data):
+                        program_total += 1
+                if len(programs.workout_plan) < 50:
+                    break
+                page += 1
+            results["workout_programs"] = program_total
+        except Exception:
+            logger.debug("Could not sync workout programs")
+
+        # 4. Exercises
+        try:
+            page = 1
+            exercise_total = 0
+            while True:
+                exercises = await client.list_exercises(page, 50)
+                for ex in exercises.exercises:
+                    ex_data = ex.model_dump()
+                    if await asyncio.to_thread(sync.upsert_exercise, ex_data):
+                        exercise_total += 1
+                if len(exercises.exercises) < 50:
+                    break
+                page += 1
+            results["exercises"] = exercise_total
+        except Exception:
+            logger.debug("Could not sync exercises")
+
+        results["db_path"] = str(sync._db_path)
+        return _compact({"status": "synced", **results})
+
+    @mcp.tool()
+    async def sync_client_data(client_uuid: str, db_path: str = "") -> str:
+        """Incrementally sync data for a single client to the local SQLite database.
+
+        Syncs check-ins, progress metrics, habits, and chat messages for
+        one client. Faster than sync_all_data when you only need one client.
+        """
+        client = _get_client()
+        sync = _get_sync() if not db_path else SyncStore(db_path)
+        if db_path:
+            _sync_var.set(sync)
+
+        results: dict[str, Any] = {"client_uuid": client_uuid}
+
+        # Fetch and upsert client profile
+        try:
+            resp = await client.get_client_action("view", client_uuid)
+            client_data = resp.json()
+            await asyncio.to_thread(sync.upsert_client, client_data)
+        except Exception:
+            logger.debug("Could not sync client profile for %s", client_uuid)
+
+        # Check-ins
+        try:
+            ci_resp = await client.list_client_checkins(client_uuid)
+            ci_data = ci_resp.json()
+            checkins: list[dict[str, Any]] = []
+            if isinstance(ci_data, dict):
+                checkins = ci_data.get(
+                    "checkins", ci_data.get("check_ins", ci_data.get("data", []))
+                )
+                if isinstance(checkins, dict):
+                    checkins = checkins.get("checkins", checkins.get("check_ins", []))
+            elif isinstance(ci_data, list):
+                checkins = ci_data
+            ci_result = await asyncio.to_thread(sync.upsert_checkins, client_uuid, checkins)
+            results["checkins"] = ci_result["checkins"]
+            results["photos_tracked"] = ci_result["photos"]
+        except Exception:
+            results["checkins_error"] = "Could not sync check-ins"
+
+        # Progress metrics
+        metrics = ["weight", "bodyfat", "steps", "chest", "waist", "hips", "arms", "thighs"]
+        progress_total = 0
+        for metric in metrics:
+            try:
+                p_resp = await client.get_chart_data(client_uuid, value=metric, range_type="all")
+                p_data: list[dict[str, Any]] = []
+                try:
+                    raw = p_resp.json()
+                    if isinstance(raw, list):
+                        p_data = raw
+                    elif isinstance(raw, dict):
+                        p_data = raw.get("data", raw.get("chart_data", []))
+                        if isinstance(p_data, dict):
+                            p_data = []
+                except Exception:
+                    pass
+                if p_data:
+                    progress_total += await asyncio.to_thread(
+                        sync.upsert_progress, client_uuid, metric, p_data
+                    )
+            except Exception:
+                pass
+        results["progress_points"] = progress_total
+
+        # Habits
+        try:
+            h_resp = await client.list_habits(client_uuid)
+            h_data = h_resp.json()
+            habits = h_data.get("habits", h_data.get("data", []))
+            if isinstance(habits, list):
+                results["habits"] = await asyncio.to_thread(sync.upsert_habits, client_uuid, habits)
+        except Exception:
+            results["habits_error"] = "Could not sync habits"
+
+        # Chat messages
+        try:
+            ch_resp = await client.get_chat_messages(client_uuid)
+            ch_data = ch_resp.json()
+            messages = ch_data.get("messages", ch_data.get("data", []))
+            if isinstance(messages, list):
+                results["chat_messages"] = await asyncio.to_thread(
+                    sync.upsert_chat_messages, client_uuid, messages
+                )
+        except Exception:
+            results["chat_error"] = "Could not sync chat"
+
+        results["db_path"] = str(sync._db_path)
+        return _compact({"status": "synced", **results})
+
+    @mcp.tool()
+    async def get_sync_status() -> str:
+        """Show the current state of the local SQLite sync database.
+
+        Returns counts of all synced data types, database path, and
+        pending downloads for photos and attachments.
+        """
+        sync = _get_sync()
+        summary = await asyncio.to_thread(sync.get_sync_summary)
+        pending_photos = await asyncio.to_thread(sync.get_pending_photos, 0)
+        pending_attachments = await asyncio.to_thread(sync.get_pending_attachments, 0)
+        summary["pending_photo_downloads"] = len(pending_photos)
+        summary["pending_attachment_downloads"] = len(pending_attachments)
+        return _compact(summary)
+
+    @mcp.tool()
+    async def query_local_checkins(client_uuid: str, limit: int = 50) -> str:
+        """Query check-in data from the local SQLite database (no API call).
+
+        Returns check-ins stored locally from a previous sync. Use
+        sync_client_data or sync_all_data to populate data first.
+        """
+        sync = _get_sync()
+        checkins = await asyncio.to_thread(sync.query_checkins, client_uuid, limit)
+        return _compact({"client_uuid": client_uuid, "checkins": checkins, "count": len(checkins)})
+
+    @mcp.tool()
+    async def query_local_progress(
+        client_uuid: str, metric: str = "weight", limit: int = 200
+    ) -> str:
+        """Query progress metric data from the local SQLite database (no API call).
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+        """
+        sync = _get_sync()
+        data = await asyncio.to_thread(sync.query_progress, client_uuid, metric, limit)
+        return _compact(
+            {"client_uuid": client_uuid, "metric": metric, "data": data, "count": len(data)}
+        )
+
+    @mcp.tool()
+    async def query_local_chat(client_uuid: str, limit: int = 100) -> str:
+        """Query chat messages from the local SQLite database (no API call)."""
+        sync = _get_sync()
+        messages = await asyncio.to_thread(sync.query_chat, client_uuid, limit)
+        return _compact({"client_uuid": client_uuid, "messages": messages, "count": len(messages)})
+
+    @mcp.tool()
+    async def download_pending_media(
+        output_dir: str = "",
+        limit: int = 50,
+    ) -> str:
+        """Download pending photos and attachments tracked by the sync database.
+
+        Downloads images from check-ins and media attachments from exercises/
+        programs that haven't been downloaded yet.
+
+        Files are saved to output_dir (default: ~/.kahunas/media/).
+        """
+        import httpx as httpx_lib
+
+        sync = _get_sync()
+        if not output_dir:
+            output_dir = os.path.expanduser("~/.kahunas/media")
+        media_dir = Path(output_dir)
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        results: dict[str, Any] = {"output_dir": str(media_dir)}
+        downloaded_photos = 0
+        downloaded_attachments = 0
+        errors = 0
+
+        async with httpx_lib.AsyncClient(timeout=30.0) as http:
+            # Download pending photos
+            pending_photos = await asyncio.to_thread(sync.get_pending_photos, limit)
+            for photo in pending_photos:
+                url = photo["photo_url"]
+                checkin_uuid = photo["checkin_uuid"]
+                client_uuid = photo["client_uuid"]
+                try:
+                    resp = await http.get(url)
+                    if resp.status_code == 200:
+                        # Determine extension from content type or URL
+                        ext = ".jpg"
+                        ct = resp.headers.get("content-type", "")
+                        if "png" in ct:
+                            ext = ".png"
+                        elif "webp" in ct:
+                            ext = ".webp"
+
+                        client_dir = media_dir / "photos" / client_uuid[:8]
+                        client_dir.mkdir(parents=True, exist_ok=True)
+                        filename = f"{checkin_uuid[:8]}_{downloaded_photos}{ext}"
+                        local_path = client_dir / filename
+                        await asyncio.to_thread(local_path.write_bytes, resp.content)
+                        await asyncio.to_thread(
+                            sync.mark_photo_downloaded, checkin_uuid, url, str(local_path)
+                        )
+                        downloaded_photos += 1
+                except Exception:
+                    errors += 1
+
+            # Download pending attachments
+            pending_atts = await asyncio.to_thread(sync.get_pending_attachments, limit)
+            for att in pending_atts:
+                url = att["file_url"]
+                parent_uuid = att["parent_uuid"]
+                file_name = att.get("file_name", "")
+                try:
+                    resp = await http.get(url)
+                    if resp.status_code == 200:
+                        att_dir = media_dir / "attachments" / parent_uuid[:8]
+                        att_dir.mkdir(parents=True, exist_ok=True)
+                        safe_name = file_name or f"attachment_{downloaded_attachments}"
+                        local_path = att_dir / safe_name
+                        await asyncio.to_thread(local_path.write_bytes, resp.content)
+                        await asyncio.to_thread(
+                            sync.mark_attachment_downloaded, parent_uuid, url, str(local_path)
+                        )
+                        downloaded_attachments += 1
+                except Exception:
+                    errors += 1
+
+        results["photos_downloaded"] = downloaded_photos
+        results["attachments_downloaded"] = downloaded_attachments
+        results["errors"] = errors
+        results["remaining_photos"] = len(pending_photos) - downloaded_photos
+        results["remaining_attachments"] = len(pending_atts) - downloaded_attachments
+        return _compact(results)
 
     return mcp
