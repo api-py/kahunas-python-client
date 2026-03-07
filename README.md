@@ -5,14 +5,19 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 ## Features
 
 - **Python Client** — Async HTTP client (`httpx`) with Pydantic v2 models, automatic token refresh, retry logic, and connection resilience
-- **MCP Server** — Stdio-based [Model Context Protocol](https://modelcontextprotocol.io/) server with **57 tools** and compact JSON payloads optimised for LLM context windows
+- **MCP Server** — Stdio-based [Model Context Protocol](https://modelcontextprotocol.io/) server with **68 tools** and compact JSON payloads optimised for LLM context windows
 - **CLI** — Command-line interface with rich terminal output for managing clients, workouts, exercises, and exports
 - **Charts** — Generate PNG progress charts (body weight, body fat, steps, measurements) using `matplotlib`
 - **Calendar Sync** — Sync Kahunas appointments with Google Calendar or Apple Calendar (iCal), with preview/add/remove/sync/trust modes for LLM-driven orchestration
 - **Check-in History** — Tabular check-in summaries with body measurements, lifestyle ratings, and trend analysis
 - **Local Metrics Store** — SQLite-backed timeseries database for offline chart generation and metric queries
 - **WhatsApp Integration** — Send messages and attachments to clients via WhatsApp Business Cloud API with automatic phone number normalisation (UK +44 default)
-- **Data Export** — Export all client data (profiles, check-ins, progress photos, workouts, habits, chat history) to Excel files
+- **Data Export** — Export all client data (profiles, check-ins, progress photos, workouts, habits, chat history) to Excel files and PDF reports
+- **PDF Export** — Generate professionally formatted PDFs for workout programs, check-in summaries, and workout plans using `fpdf2`
+- **Anomaly Detection** — Detect significant changes in weight, body measurements, lifestyle ratings, and sleep/step minimums with configurable thresholds
+- **Check-in Reminders** — Find overdue clients and send personalised reminders via Kahunas chat and/or WhatsApp
+- **Phone Alignment** — Compare and fix phone numbers between Kahunas client data and WhatsApp E.164 format
+- **Messaging Persona** — Configurable persona template for client communications (default: London-based PT, 15 years experience, British English)
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
 
@@ -65,6 +70,24 @@ export KAHUNAS_WATER_UNIT="ml"        # ml, l, or oz
 
 # Optional: Timezone
 export KAHUNAS_TIMEZONE="Europe/London"  # IANA timezone
+
+# Optional: Check-in Reminders
+export KAHUNAS_CHECKIN_REMINDER_DAYS="7"  # Days before overdue
+
+# Optional: Anomaly Detection Thresholds
+export KAHUNAS_ANOMALY_WEIGHT_PCT="20.0"     # Weight % change threshold
+export KAHUNAS_ANOMALY_BODY_PCT="15.0"       # Body measurement % threshold
+export KAHUNAS_ANOMALY_LIFESTYLE_ABS="3.0"   # Lifestyle rating abs threshold
+export KAHUNAS_ANOMALY_WINDOW_DAYS="7"       # Lookback window in days
+export KAHUNAS_ANOMALY_SLEEP_MINIMUM="7.0"   # Min sleep score to flag
+export KAHUNAS_ANOMALY_STEP_MINIMUM="5000"   # Min daily steps to flag
+
+# Optional: Messaging Persona
+export KAHUNAS_PERSONA_TEMPLATE=""            # Inline persona template
+export KAHUNAS_PERSONA_TEMPLATE_PATH=""       # Path to template file
+export KAHUNAS_PERSONA_WEIGHT_DEVIATION_PCT="20.0"  # Weight deviation %
+export KAHUNAS_PERSONA_SLEEP_MINIMUM="7.0"          # Sleep threshold
+export KAHUNAS_PERSONA_STEP_MINIMUM="5000"          # Step threshold
 ```
 
 ### 2. `.env` File
@@ -259,7 +282,7 @@ Add to your project's `.claude/mcp.json`:
 
 ### Available MCP Tools
 
-Once connected, the AI assistant has access to **57 tools** (sorted alphabetically):
+Once connected, the AI assistant has access to **68 tools** (sorted alphabetically):
 
 | Tool | Description |
 |------|-------------|
@@ -274,14 +297,19 @@ Once connected, the AI assistant has access to **57 tools** (sorted alphabetical
 | `create_habit` | Create a new habit for a client |
 | `delete_calendar_event` | Delete a calendar event |
 | `delete_checkin` | Delete a client check-in |
+| `detect_client_anomalies` | Scan a client's check-in data for anomalies and threshold breaches |
 | `discover_all_exercises` | Discover and list ALL exercises in the Kahunas exercise library |
 | `discover_diet_plans` | Discover all diet plans available in Kahunas |
 | `discover_supplement_plans` | Discover all supplement plans available in Kahunas |
 | `export_all_clients` | Export all clients data to Excel |
+| `export_checkin_summary_to_pdf` | Export a client's check-in history as a PDF with metrics table and trends |
 | `export_client_data` | Export a single client's data to Excel |
 | `export_exercises` | Export exercise library to Excel |
+| `export_workout_plan_to_pdf` | Export a client's assigned workout plan as a formatted PDF |
+| `export_workout_program_to_pdf` | Export a workout program as a professionally formatted PDF |
 | `export_workout_programs` | Export workout programs to Excel |
 | `find_client_appointments` | Find all calendar appointments for a specific client by UUID or name |
+| `find_overdue_checkins` | Find clients who haven't checked in for X days |
 | `format_appointments_gcal` | Format Kahunas appointments as Google Calendar event objects |
 | `generate_chart_from_store` | Generate a PNG chart from locally stored metric data (no API call needed) |
 | `generate_progress_chart` | Generate a PNG chart for weight, body fat, steps, etc. |
@@ -290,6 +318,7 @@ Once connected, the AI assistant has access to **57 tools** (sorted alphabetical
 | `get_client_progress` | Get body measurement progress data |
 | `get_exercise_progress` | Get exercise strength/volume progress |
 | `get_measurement_settings` | Get configured measurement unit settings (weight, height, glucose, food, water) |
+| `get_messaging_persona` | Show current persona config and template |
 | `get_workout_log` | Get workout log book for an exercise |
 | `get_workout_program` | Get full workout program details including all days and exercises |
 | `list_appointments` | List Kahunas appointments filtered by time range |
@@ -306,15 +335,20 @@ Once connected, the AI assistant has access to **57 tools** (sorted alphabetical
 | `manage_package` | Manage coaching packages |
 | `manage_supplement_plan` | Manage supplement plans |
 | `notify_client` | Send a notification to a client |
+| `phone_alignment_report` | Show phone alignment between Kahunas client data and WhatsApp E.164 format |
+| `preview_client_message` | Preview what a message to a client would look like |
 | `query_client_metrics` | Query stored metric data from the local timeseries database |
 | `remove_client` | Remove a client from Kahunas and/or their calendar appointments |
 | `restore_workout_program` | Restore an archived workout program |
+| `scan_all_client_anomalies` | Scan ALL clients for check-in anomalies and threshold breaches |
 | `search_exercises` | Search exercises by keyword |
 | `send_chat_message` | Send a Kahunas chat message to a client |
+| `send_checkin_reminders` | Send check-in reminders via Kahunas chat and/or WhatsApp |
 | `store_client_metrics` | Store client metric data points in the local timeseries database |
 | `sync_appointments_ics` | Generate an iCal (.ics) file for Apple Calendar from Kahunas appointments |
 | `sync_calendar` | Sync Kahunas appointments with Google Calendar or Apple Calendar |
 | `sync_client_metrics` | Fetch client metrics from Kahunas API and store locally |
+| `update_client_phone` | Update a client's phone number in Kahunas |
 | `update_coach_settings` | Update coach configuration settings |
 | `view_checkin` | View a client check-in |
 | `whatsapp_send_image` | Send an image via WhatsApp |
@@ -359,6 +393,53 @@ generate_chart_from_store  →  Generate charts without API calls
 list_stored_clients   →  See which clients have cached data
 ```
 
+### Anomaly Detection
+
+The anomaly detection system scans client check-in data for significant changes:
+
+- **Body metrics** (weight, waist, hips, biceps, thighs): Percentage-based thresholds
+- **Lifestyle ratings** (sleep, nutrition, workout, stress, energy, mood): Absolute-change thresholds
+- **Minimum thresholds**: Sleep quality below 7, step count below 5000
+- **Severity levels**: warning, high, critical (based on how far the change exceeds the threshold)
+
+All thresholds are configurable via `KAHUNAS_ANOMALY_*` environment variables.
+
+### Check-in Reminders
+
+Find clients who haven't checked in and send personalised reminders:
+
+```
+find_overdue_checkins     →  List clients overdue by X days
+send_checkin_reminders    →  Send via Kahunas chat and/or WhatsApp
+```
+
+### Phone Alignment
+
+Compare phone numbers stored in Kahunas with their normalised WhatsApp E.164 format:
+
+```
+phone_alignment_report    →  Show aligned/mismatched/missing numbers
+update_client_phone       →  Fix a client's phone number
+```
+
+### Messaging Persona
+
+Configure the tone and style of client communications via templates:
+
+- Default persona: London-based PT, 15 years experience, polite British English
+- Highlights weight deviations >20%, sleep deprivation (<7h), low step count
+- Customisable via inline template (`KAHUNAS_PERSONA_TEMPLATE`) or file path (`KAHUNAS_PERSONA_TEMPLATE_PATH`)
+
+### PDF Export
+
+Generate professionally formatted PDF reports:
+
+```
+export_workout_program_to_pdf   →  Workout program with exercise tables
+export_checkin_summary_to_pdf   →  Check-in history with metrics and trends
+export_workout_plan_to_pdf      →  Client's assigned workout plan
+```
+
 ### Example AI Conversations
 
 > "Show me all my clients and their check-in status"
@@ -378,6 +459,16 @@ list_stored_clients   →  See which clients have cached data
 > "Which of my clients have valid WhatsApp numbers?"
 
 > "Export all data for Jane Smith to Excel"
+
+> "Scan all my clients for anomalies in their check-in data"
+
+> "Which clients haven't checked in this week? Send them a reminder on WhatsApp"
+
+> "Show me the phone alignment report — fix any mismatched numbers"
+
+> "Export Bruce Wayne's check-in summary as a PDF"
+
+> "Preview what a reminder message to Alice would look like"
 
 ## WhatsApp Business Integration
 
@@ -454,27 +545,32 @@ kahunas_exports/20260306_143022/
 
 ```
 src/kahunas_client/
-├── __init__.py          # Package exports
-├── calendar_sync.py     # Calendar sync (iCal, Google Calendar formatting)
-├── charts.py            # Chart generation (matplotlib)
-├── checkin_history.py   # Check-in history parsing, trends, appointment overview
-├── client.py            # Async HTTP client (httpx + tenacity retries)
-├── config.py            # Configuration (env vars, YAML, .env, units, timezone)
-├── exceptions.py        # Custom exception hierarchy
-├── metrics_store.py     # Local SQLite timeseries database for progress data
-├── whatsapp.py          # WhatsApp Business API client
-├── models/              # Pydantic v2 models
-│   ├── auth.py          # Auth credentials/session
-│   ├── clients.py       # Client, CheckIn, Habit, ChatMessage
-│   ├── common.py        # Pagination, ApiResponse, MediaItem
-│   ├── exercises.py     # Exercise, ExerciseListData
-│   └── workouts.py      # WorkoutProgram, WorkoutDay, ExerciseSet
-├── mcp/                 # MCP server (FastMCP 3.x, stdio)
-│   ├── server.py        # 57 tool definitions (compact JSON payloads)
-│   ├── export.py        # Excel export manager
-│   └── __main__.py      # Entry point
-└── cli/                 # CLI (Click + Rich)
-    └── main.py          # Command definitions
+├── __init__.py           # Package exports
+├── anomaly_detection.py  # Analytics & anomaly detection on check-in timeseries
+├── calendar_sync.py      # Calendar sync (iCal, Google Calendar formatting)
+├── charts.py             # Chart generation (matplotlib)
+├── checkin_history.py    # Check-in history parsing, trends, appointment overview
+├── checkin_reminders.py  # Overdue client detection & reminder messages
+├── client.py             # Async HTTP client (httpx + tenacity retries)
+├── config.py             # Configuration (env vars, YAML, .env, units, timezone)
+├── exceptions.py         # Custom exception hierarchy
+├── metrics_store.py      # Local SQLite timeseries database for progress data
+├── pdf_export.py         # PDF generation (fpdf2) for programs, plans, summaries
+├── persona.py            # Messaging persona/template system
+├── phone_alignment.py    # Phone number alignment (Kahunas vs WhatsApp E.164)
+├── whatsapp.py           # WhatsApp Business API client
+├── models/               # Pydantic v2 models
+│   ├── auth.py           # Auth credentials/session
+│   ├── clients.py        # Client, CheckIn, Habit, ChatMessage
+│   ├── common.py         # Pagination, ApiResponse, MediaItem
+│   ├── exercises.py      # Exercise, ExerciseListData
+│   └── workouts.py       # WorkoutProgram, WorkoutDay, ExerciseSet
+├── mcp/                  # MCP server (FastMCP 3.x, stdio)
+│   ├── server.py         # 68 tool definitions (compact JSON payloads)
+│   ├── export.py         # Excel export manager
+│   └── __main__.py       # Entry point
+└── cli/                  # CLI (Click + Rich)
+    └── main.py           # Command definitions
 ```
 
 ## Development
@@ -483,7 +579,7 @@ src/kahunas_client/
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests (394 tests)
+# Run tests (560 tests)
 pytest tests/ -v
 
 # Run linter

@@ -66,6 +66,48 @@ class KahunasConfig(BaseSettings):
         description="Timezone for appointments and scheduling (IANA format, e.g. 'Europe/London')",
     )
 
+    # Check-in reminder settings
+    checkin_reminder_days: int = Field(
+        default=7, description="Days since last check-in before a client is considered overdue"
+    )
+
+    # Anomaly detection thresholds
+    anomaly_weight_pct: float = Field(
+        default=20.0, description="Weight % change threshold to flag as anomaly"
+    )
+    anomaly_body_pct: float = Field(
+        default=15.0, description="Body measurement (waist/hips/biceps/thighs) % change threshold"
+    )
+    anomaly_lifestyle_abs: float = Field(
+        default=3.0, description="Lifestyle rating (1-10 scale) absolute change threshold"
+    )
+    anomaly_window_days: int = Field(
+        default=7, description="Lookback window in days for anomaly detection"
+    )
+    anomaly_sleep_minimum: float = Field(
+        default=7.0, description="Sleep quality score below which to flag a warning"
+    )
+    anomaly_step_minimum: int = Field(
+        default=5000, description="Daily step count below which to flag a warning"
+    )
+
+    # Persona / messaging template settings
+    persona_template: str = Field(
+        default="", description="Inline persona template text (overrides default)"
+    )
+    persona_template_path: str = Field(
+        default="", description="Path to persona template file (highest priority)"
+    )
+    persona_weight_deviation_pct: float = Field(
+        default=20.0, description="Weight deviation % to highlight in persona messages"
+    )
+    persona_sleep_minimum: float = Field(
+        default=7.0, description="Sleep hours below which persona messages highlight concern"
+    )
+    persona_step_minimum: int = Field(
+        default=5000, description="Step count below which persona messages highlight concern"
+    )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> KahunasConfig:
         """Load config from a YAML file, merged with env vars."""
