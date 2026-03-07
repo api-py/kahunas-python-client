@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime
@@ -87,8 +88,8 @@ class ExportManager:
         client_dir = base / _sanitize_name(client_name)
         client_dir.mkdir(parents=True, exist_ok=True)
 
-        # Profile
-        self._export_client_profile(client_dir, client_data)
+        # Profile (blocking I/O — run in thread pool)
+        await asyncio.to_thread(self._export_client_profile, client_dir, client_data)
 
         # Check-ins
         if include_checkins:
@@ -130,7 +131,7 @@ class ExportManager:
             ws.title = "Clients"
             _add_header_row(ws, ["Status"])
             ws.cell(row=2, column=1, value="No clients found")
-            wb.save(base / "clients_summary.xlsx")
+            await asyncio.to_thread(wb.save, base / "clients_summary.xlsx")
             return base
 
         for client in clients:
@@ -191,7 +192,7 @@ class ExportManager:
             page += 1
 
         _auto_width(ws)
-        wb.save(filepath)
+        await asyncio.to_thread(wb.save, filepath)
         logger.info("Exported exercise library to %s", filepath)
         return filepath
 
@@ -208,7 +209,7 @@ class ExportManager:
                 try:
                     detail_data = await self._client.get_workout_program(program_summary.uuid)
                     program = detail_data.workout_plan
-                    self._export_single_program(programs_dir, program)
+                    await asyncio.to_thread(self._export_single_program, programs_dir, program)
                 except Exception as e:
                     logger.warning("Failed to export program %s: %s", program_summary.uuid, e)
 
@@ -352,7 +353,7 @@ class ExportManager:
                     await self._download_photos(photos, photos_dir, prefix=f"checkin_{i}")
 
         _auto_width(ws)
-        wb.save(checkins_dir / "checkins_summary.xlsx")
+        await asyncio.to_thread(wb.save, checkins_dir / "checkins_summary.xlsx")
 
     async def _export_client_progress(self, client_dir: Path, client_uuid: str) -> None:
         """Export client progress data to Excel."""
@@ -387,7 +388,7 @@ class ExportManager:
                 logger.debug("No %s data for client: %s", metric, e)
 
         if wb.sheetnames:
-            wb.save(progress_dir / "body_measurements.xlsx")
+            await asyncio.to_thread(wb.save, progress_dir / "body_measurements.xlsx")
 
     async def _export_client_habits(self, client_dir: Path, client_uuid: str) -> None:
         """Export client habits to Excel."""
@@ -418,7 +419,7 @@ class ExportManager:
             ws.cell(row=i, column=4, value=habit.get("uuid", ""))
 
         _auto_width(ws)
-        wb.save(habits_dir / "habit_tracking.xlsx")
+        await asyncio.to_thread(wb.save, habits_dir / "habit_tracking.xlsx")
 
     async def _export_client_chat(self, client_dir: Path, client_uuid: str) -> None:
         """Export chat messages to Excel."""
@@ -451,7 +452,7 @@ class ExportManager:
             ws.cell(row=i, column=4, value="Yes" if msg.get("read") else "No")
 
         _auto_width(ws)
-        wb.save(chat_dir / "chat_history.xlsx")
+        await asyncio.to_thread(wb.save, chat_dir / "chat_history.xlsx")
 
     async def _download_photos(self, photos: list[Any], target_dir: Path, prefix: str = "") -> None:
         """Download photos to a directory."""
@@ -471,7 +472,7 @@ class ExportManager:
                     if resp.status_code == 200:
                         ext = url.rsplit(".", 1)[-1][:4] if "." in url else "jpg"
                         filename = f"{prefix}_{i + 1}.{ext}" if prefix else f"photo_{i + 1}.{ext}"
-                        (target_dir / filename).write_bytes(resp.content)
+                        await asyncio.to_thread((target_dir / filename).write_bytes, resp.content)
                 except Exception as e:
                     logger.debug("Failed to download photo %s: %s", url, e)
 
