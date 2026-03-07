@@ -80,8 +80,10 @@ class KahunasClient:
     async def __aexit__(self, *args: Any) -> None:
         if self._http:
             await self._http.aclose()
+            self._http = None
         if self._web_http:
             await self._web_http.aclose()
+            self._web_http = None
 
     @property
     def is_authenticated(self) -> bool:
@@ -101,33 +103,42 @@ class KahunasClient:
             raise KahunasError("Client not initialized. Use 'async with' context manager.")
 
         # Step 1: Get login page for CSRF token
-        login_page = await web.get("/login")
+        try:
+            login_page = await web.get("/login")
+        except httpx.ConnectError as exc:
+            raise KahunasError(f"Cannot connect to {self._config.web_base_url}: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise KahunasError(f"Login page request timed out: {exc}") from exc
+
         csrf_match = _CSRF_RE.search(login_page.text)
         if not csrf_match:
             raise AuthenticationError("Could not find CSRF token on login page")
         csrf_token = csrf_match.group(1)
 
         # Step 2: POST login form
-        resp = await web.post(
-            "/login",
-            data={
-                "csrf_kahunas_token": csrf_token,
-                "identity": self._config.email,
-                "password": self._config.password,
-                "signin": "Login",
-            },
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": f"{self._config.web_base_url}/login",
-                "Origin": self._config.web_base_url,
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            },
-            follow_redirects=True,
-        )
+        try:
+            resp = await web.post(
+                "/login",
+                data={
+                    "csrf_kahunas_token": csrf_token,
+                    "identity": self._config.email,
+                    "password": self._config.password,
+                    "signin": "Login",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"{self._config.web_base_url}/login",
+                    "Origin": self._config.web_base_url,
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
+                follow_redirects=True,
+            )
+        except httpx.TimeoutException as exc:
+            raise KahunasError(f"Login request timed out: {exc}") from exc
 
         if "/login" in str(resp.url):
             raise AuthenticationError("Login failed — check email and password")
@@ -177,9 +188,18 @@ class KahunasClient:
     async def _handle_response(self, resp: httpx.Response) -> dict[str, Any]:
         """Parse and validate an API response, handling token refresh."""
         if resp.status_code == 429:
-            raise RateLimitError("Rate limited by API", code=429)
+            retry_after = resp.headers.get("Retry-After", "5")
+            raise RateLimitError(f"Rate limited by API (retry after {retry_after}s)", code=429)
         if resp.status_code >= 500:
             raise ServerError(f"Server error: {resp.status_code}", code=resp.status_code)
+
+        # Guard against non-JSON responses (HTML error pages, redirects)
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" not in content_type and resp.status_code != 200:
+            raise KahunasError(
+                f"Unexpected response (status={resp.status_code}, "
+                f"type={content_type[:50]}): {resp.text[:200]}"
+            )
 
         try:
             data = resp.json()
@@ -213,7 +233,9 @@ class KahunasClient:
         return data
 
     @retry(
-        retry=retry_if_exception_type((RateLimitError, ServerError, TokenExpiredError)),
+        retry=retry_if_exception_type(
+            (RateLimitError, ServerError, TokenExpiredError, httpx.ConnectError)
+        ),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
@@ -228,13 +250,16 @@ class KahunasClient:
         """Make an authenticated request to the REST API."""
         if not self._http:
             raise KahunasError("Client not initialized")
-        resp = await self._http.request(
-            method, f"/{path}", params=params, json=json_data, headers=self._api_headers()
-        )
+        try:
+            resp = await self._http.request(
+                method, f"/{path}", params=params, json=json_data, headers=self._api_headers()
+            )
+        except httpx.TimeoutException as exc:
+            raise ServerError(f"Request timed out: {method} {path}") from exc
         return await self._handle_response(resp)
 
     @retry(
-        retry=retry_if_exception_type((RateLimitError, ServerError)),
+        retry=retry_if_exception_type((RateLimitError, ServerError, httpx.ConnectError)),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
@@ -261,7 +286,12 @@ class KahunasClient:
                 data = {}
             data.setdefault("csrf_kahunas_token", self._session.csrf_token)
             headers["Auth-User-Token"] = self._session.auth_token
-        return await self._web_http.request(method, path, data=data, params=params, headers=headers)
+        try:
+            return await self._web_http.request(
+                method, path, data=data, params=params, headers=headers
+            )
+        except httpx.TimeoutException as exc:
+            raise ServerError(f"Web request timed out: {method} {path}") from exc
 
     # ── REST API: Workout Programs ──
 
@@ -421,7 +451,11 @@ class KahunasClient:
     async def get_chart_data(
         self, client_uuid: str, value: str = "", range_type: str = "", data_range: str = ""
     ) -> httpx.Response:
-        """Get chart/progress data for a client."""
+        """Get chart/progress data for a client.
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+        Range types: week, month, quarter, year, all.
+        """
         return await self._web_request(
             "GET",
             f"/client/chartData/{client_uuid}",
