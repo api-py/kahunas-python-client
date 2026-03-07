@@ -1,9 +1,10 @@
-"""MCP server exposing Kahunas API as tools (stdio transport)."""
+"""MCP server exposing Kahunas API as tools (stdio and HTTP transport)."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import os
@@ -35,9 +36,19 @@ from .export import ExportManager
 
 logger = logging.getLogger(__name__)
 
-_client: KahunasClient | None = None
-_export: ExportManager | None = None
-_metrics: MetricsStore | None = None
+# Session-isolated state using contextvars so each HTTP session gets its own
+# KahunasClient, ExportManager, and MetricsStore instance.  For stdio
+# transport (single session) the context variables behave identically to
+# plain globals.
+_client_var: contextvars.ContextVar[KahunasClient | None] = contextvars.ContextVar(
+    "_client_var", default=None
+)
+_export_var: contextvars.ContextVar[ExportManager | None] = contextvars.ContextVar(
+    "_export_var", default=None
+)
+_metrics_var: contextvars.ContextVar[MetricsStore | None] = contextvars.ContextVar(
+    "_metrics_var", default=None
+)
 
 # Constants to avoid string duplication (SonarQube S1192)
 _CALENDAR_EVENTS_PATH = "/coach/getCalendarEvents"
@@ -45,22 +56,25 @@ _CALENDAR_FETCH_ERROR = "Could not fetch calendar events"
 
 
 def _get_client() -> KahunasClient:
-    if _client is None:
+    client = _client_var.get()
+    if client is None:
         raise RuntimeError("Kahunas client not initialized — call login() first")
-    return _client
+    return client
 
 
 def _get_export() -> ExportManager:
-    if _export is None:
+    export = _export_var.get()
+    if export is None:
         raise RuntimeError("Export manager not initialized — call login() first")
-    return _export
+    return export
 
 
 def _get_metrics() -> MetricsStore:
-    global _metrics
-    if _metrics is None:
-        _metrics = MetricsStore()
-    return _metrics
+    store = _metrics_var.get()
+    if store is None:
+        store = MetricsStore()
+        _metrics_var.set(store)
+    return store
 
 
 def _compact(data: Any) -> str:
@@ -122,12 +136,11 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     @mcp.tool()
     async def login() -> str:
         """Authenticate with Kahunas. Call this first before using other tools."""
-        global _client, _export
         cfg = config or KahunasConfig.from_env()
         client = KahunasClient(cfg)
         await client.__aenter__()
-        _client = client
-        _export = ExportManager(client)
+        _client_var.set(client)
+        _export_var.set(ExportManager(client))
         return _compact(
             {
                 "status": "authenticated",
@@ -139,14 +152,15 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     @mcp.tool()
     async def logout() -> str:
         """Close the Kahunas session."""
-        global _client, _export, _metrics
-        if _client:
-            await _client.__aexit__(None, None, None)
-            _client = None
-            _export = None
-        if _metrics:
-            _metrics.close()
-            _metrics = None
+        client = _client_var.get()
+        if client:
+            await client.__aexit__(None, None, None)
+            _client_var.set(None)
+            _export_var.set(None)
+        store = _metrics_var.get()
+        if store:
+            store.close()
+            _metrics_var.set(None)
         return '{"status":"logged_out"}'
 
     # ── Workout Programs ──

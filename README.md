@@ -5,7 +5,7 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 ## Features
 
 - **Python Client** — Async HTTP client (`httpx`) with Pydantic v2 models, automatic token refresh, retry logic, and connection resilience
-- **MCP Server** — Stdio-based [Model Context Protocol](https://modelcontextprotocol.io/) server with **68 tools** and compact JSON payloads optimised for LLM context windows
+- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io/) server with **68 tools**, compact JSON payloads, and support for **stdio**, **HTTP/SSE**, and **streamable-http** transports (session-isolated via `contextvars`)
 - **CLI** — Command-line interface with rich terminal output for managing clients, workouts, exercises, and exports
 - **Charts** — Generate PNG progress charts (body weight, body fat, steps, measurements) using `matplotlib`
 - **Calendar Sync** — Sync Kahunas appointments with Google Calendar or Apple Calendar (iCal), with preview/add/remove/sync/trust modes for LLM-driven orchestration
@@ -17,7 +17,8 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 - **Anomaly Detection** — Detect significant changes in weight, body measurements, lifestyle ratings, and sleep/step minimums with configurable thresholds
 - **Check-in Reminders** — Find overdue clients and send personalised reminders via Kahunas chat and/or WhatsApp
 - **Phone Alignment** — Compare and fix phone numbers between Kahunas client data and WhatsApp E.164 format
-- **Messaging Persona** — Configurable persona template for client communications (default: London-based PT, 15 years experience, British English)
+- **Messaging Persona** — Configurable persona template for client communications (default: London-based PT, 15 years experience, British English) — see [`persona.example.txt`](persona.example.txt)
+- **Docker & Cloud** — Production-ready Dockerfile for Azure Container Instances, AWS Lambda (container), and Kubernetes
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
 
@@ -225,15 +226,18 @@ kahunas export workouts --output ./exports
 # Raw API call
 kahunas api v1/workoutprogram
 
-# Start the MCP server (stdio)
+# Start the MCP server (stdio, default)
 kahunas serve
+
+# Start in HTTP mode (for remote hosting)
+kahunas serve --transport http --port 8000
 ```
 
 ## Using as an MCP Server
 
-The Kahunas MCP server exposes all API endpoints as tools that AI assistants can call. It uses the **stdio** transport.
+The Kahunas MCP server exposes all API endpoints as tools that AI assistants can call. It supports **stdio** (default), **HTTP/SSE**, and **streamable-http** transports. HTTP sessions are fully isolated via `contextvars` — each connection gets its own `KahunasClient`, `ExportManager`, and `MetricsStore`.
 
-### With Claude Desktop
+### With Claude Desktop (stdio)
 
 Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -255,7 +259,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
-### With Claude Code (CLI)
+### With Claude Code (stdio)
 
 Add to your project's `.claude/mcp.json`:
 
@@ -268,6 +272,33 @@ Add to your project's `.claude/mcp.json`:
         "KAHUNAS_EMAIL": "you@example.com",
         "KAHUNAS_PASSWORD": "your-password"
       }
+    }
+  }
+}
+```
+
+### HTTP/SSE Transport (Remote Hosting)
+
+Run the MCP server over HTTP for remote access from any MCP client:
+
+```bash
+# CLI
+kahunas serve --transport http --host 0.0.0.0 --port 8000
+
+# Or via module
+python -m kahunas_client.mcp http
+
+# Or via environment variables
+KAHUNAS_MCP_TRANSPORT=http KAHUNAS_MCP_PORT=8000 kahunas-mcp
+```
+
+Connect from an MCP client using the SSE/HTTP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "kahunas": {
+      "url": "http://your-server:8000/sse"
     }
   }
 }
@@ -422,6 +453,7 @@ Configure the tone and style of client communications via templates:
 - Default persona: London-based PT, 15 years experience, polite British English
 - Highlights weight deviations >20%, sleep deprivation (<7h), low step count
 - Customisable via inline template (`KAHUNAS_PERSONA_TEMPLATE`) or file path (`KAHUNAS_PERSONA_TEMPLATE_PATH`)
+- A detailed example template is provided at [`persona.example.txt`](persona.example.txt) with full documentation of available variables, communication style guidelines, and coaching philosophy
 
 ### PDF Export
 
@@ -511,6 +543,24 @@ Progress charts are generated using **matplotlib** (industry-standard Python plo
 
 Charts include trend lines, min/max/average stats, and change annotations.
 
+### Example Charts
+
+**Body Weight — 12-week programme**
+
+![Weight Chart](docs/images/chart_weight.png)
+
+**Daily Step Count — 30 days**
+
+![Steps Chart](docs/images/chart_steps.png)
+
+**Body Fat % — quarterly trend**
+
+![Body Fat Chart](docs/images/chart_bodyfat.png)
+
+**Waist Measurement — quarterly trend**
+
+![Waist Chart](docs/images/chart_waist.png)
+
 ## Data Export
 
 Exports are organized in a user-friendly directory structure with Excel files:
@@ -533,6 +583,58 @@ kahunas_exports/20260306_143022/
 │   └── Upper Lower.xlsx
 └── exercise_library.xlsx
 ```
+
+## Docker Deployment
+
+The included Dockerfile supports **Azure Container Instances**, **AWS Lambda** (container image), and any Docker/Kubernetes host.
+
+### Build
+
+```bash
+docker build -t kahunas-mcp .
+```
+
+### Run (Azure ACI / Standalone)
+
+```bash
+docker run -p 8000:8000 \
+  -e KAHUNAS_EMAIL=you@example.com \
+  -e KAHUNAS_PASSWORD=your-password \
+  kahunas-mcp
+```
+
+The server starts in HTTP mode on port 8000 by default.
+
+### Run (AWS Lambda)
+
+```bash
+# Build with Lambda support
+docker build -t kahunas-mcp-lambda .
+
+# Test locally with Lambda Runtime Interface Emulator
+docker run -p 9000:8080 \
+  -e KAHUNAS_MCP_LAMBDA=1 \
+  -e KAHUNAS_EMAIL=you@example.com \
+  -e KAHUNAS_PASSWORD=your-password \
+  kahunas-mcp-lambda
+```
+
+For AWS Lambda deployment, push to ECR and create a Lambda function using the container image. Install the optional Lambda dependencies:
+
+```bash
+pip install kahunas-client[lambda]
+```
+
+### Environment Variables (Docker)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KAHUNAS_MCP_TRANSPORT` | `http` | Transport: `http`, `sse`, `streamable-http` |
+| `KAHUNAS_MCP_HOST` | `0.0.0.0` | Bind address |
+| `KAHUNAS_MCP_PORT` | `8000` | Port |
+| `KAHUNAS_MCP_LAMBDA` | (unset) | Set to `1` for AWS Lambda mode |
+| `KAHUNAS_EMAIL` | | Coach account email |
+| `KAHUNAS_PASSWORD` | | Coach account password |
 
 ## Architecture
 
@@ -558,10 +660,11 @@ src/kahunas_client/
 │   ├── common.py         # Pagination, ApiResponse, MediaItem
 │   ├── exercises.py      # Exercise, ExerciseListData
 │   └── workouts.py       # WorkoutProgram, WorkoutDay, ExerciseSet
-├── mcp/                  # MCP server (FastMCP 3.x, stdio)
-│   ├── server.py         # 68 tool definitions (compact JSON payloads)
-│   ├── export.py         # Excel export manager
-│   └── __main__.py       # Entry point
+├── mcp/                  # MCP server (FastMCP 3.x, stdio + HTTP/SSE)
+│   ├── server.py         # 68 tool definitions (compact JSON, contextvars isolation)
+│   ├── export.py         # Excel export manager (async I/O)
+│   ├── lambda_handler.py # AWS Lambda handler (Mangum)
+│   └── __main__.py       # Entry point (stdio, http, sse, streamable-http)
 └── cli/                  # CLI (Click + Rich)
     └── main.py           # Command definitions
 ```
