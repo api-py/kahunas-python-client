@@ -24,6 +24,15 @@ class KahunasConfig(BaseSettings):
     max_retries: int = Field(default=3, description="Max retry attempts for failed requests")
     retry_base_delay: float = Field(default=1.0, description="Base delay between retries (seconds)")
 
+    # WhatsApp Business API settings
+    whatsapp_token: str = Field(default="", description="WhatsApp Cloud API access token")
+    whatsapp_phone_number_id: str = Field(
+        default="", description="WhatsApp Business phone number ID"
+    )
+    whatsapp_default_country_code: str = Field(
+        default="44", description="Default country code for phone normalisation (44 = UK)"
+    )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> KahunasConfig:
         """Load config from a YAML file, merged with env vars."""

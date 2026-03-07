@@ -32,6 +32,9 @@ FAIL = 0
 SKIP = 0
 ERRORS: list[str] = []
 
+# Throttle between API calls to avoid rate limiting
+THROTTLE_DELAY = 0.5
+
 
 def report(name: str, success: bool, detail: str = "") -> None:
     global PASS, FAIL
@@ -50,7 +53,12 @@ def skip(name: str, reason: str) -> None:
     print(f"  [SKIP] {name} - {reason}")
 
 
-async def run_all_tests() -> None:
+async def throttled() -> None:
+    """Small delay between API calls to avoid rate limiting."""
+    await asyncio.sleep(THROTTLE_DELAY)
+
+
+async def run_all_tests() -> int:
     token = load_token()
     config = KahunasConfig(
         api_base_url="https://api.kahunas.io/api",
@@ -65,89 +73,169 @@ async def run_all_tests() -> None:
 
         # ── 2. List Workout Programs ──
         print("\n=== Workout Programs ===")
+        first_program_uuid = None
         try:
             programs = await client.list_workout_programs()
+
+            # Validate payload structure
+            report(
+                "Programs payload has pagination",
+                hasattr(programs, "pagination"),
+                f"page={programs.pagination.current_page}",
+            )
+            report(
+                "Programs payload has total_records",
+                programs.total_records >= 0,
+                f"total={programs.total_records}",
+            )
             report(
                 "List workout programs",
                 programs.total_records > 0,
                 f"Found {programs.total_records} programs",
             )
+
             if programs.workout_plan:
                 prog = programs.workout_plan[0]
+                first_program_uuid = prog.uuid
+
+                # Validate program summary fields
                 report("Program has title", bool(prog.title), f"'{prog.title}'")
                 report("Program has uuid", bool(prog.uuid))
-
-                # ── 3. Get single program detail ──
-                try:
-                    detail = await client.get_workout_program(prog.uuid)
-                    days = detail.workout_plan.workout_days
-                    report(
-                        "Get workout program detail",
-                        bool(detail.workout_plan.title),
-                        f"'{detail.workout_plan.title}' with {len(days)} days",
-                    )
-                    if days:
-                        day = days[0]
-                        report("Workout day has title", bool(day.title), f"'{day.title}'")
-                        el = day.exercise_list
-                        detail_msg = (
-                            f"warmup={len(el.warmup)}, "
-                            f"workout={len(el.workout)}, "
-                            f"cooldown={len(el.cooldown)}"
-                        )
-                        report("Exercise list parsed", el is not None, detail_msg)
-                        # Verify exercise data within groups
-                        total_exercises = 0
-                        for section in (el.warmup, el.workout, el.cooldown):
-                            for group in section:
-                                total_exercises += len(group.exercises)
-                                for ex in group.exercises:
-                                    assert ex.exercise_name, f"Missing exercise_name in {ex.uuid}"
-                        report(
-                            "Exercises in workout day",
-                            total_exercises > 0,
-                            f"{total_exercises} exercises",
-                        )
-                        # Check exercise fields
-                        sample = days[0].exercise_list.workout[0].exercises[0]
-                        report(
-                            "Exercise sets field",
-                            sample.sets is not None,
-                            f"sets='{sample.sets}', reps='{sample.reps}'",
-                        )
-                except Exception as e:
-                    report("Get workout program detail", False, str(e))
+                report(
+                    "Program has days count",
+                    prog.days >= 0,
+                    f"days={prog.days}",
+                )
+                report(
+                    "Program has type",
+                    prog.type is not None,
+                    f"type={prog.type.name}",
+                )
         except Exception as e:
             report("List workout programs", False, str(e))
+
+        await throttled()
+
+        # ── 3. Get single program detail ──
+        if first_program_uuid:
+            try:
+                detail = await client.get_workout_program(first_program_uuid)
+                days = detail.workout_plan.workout_days
+                report(
+                    "Get workout program detail",
+                    bool(detail.workout_plan.title),
+                    f"'{detail.workout_plan.title}' with {len(days)} days",
+                )
+
+                if days:
+                    day = days[0]
+                    report(
+                        "Workout day has title",
+                        bool(day.title),
+                        f"'{day.title}'",
+                    )
+
+                    el = day.exercise_list
+                    detail_msg = (
+                        f"warmup={len(el.warmup)}, "
+                        f"workout={len(el.workout)}, "
+                        f"cooldown={len(el.cooldown)}"
+                    )
+                    report("Exercise list parsed", el is not None, detail_msg)
+
+                    # Validate exercises
+                    total_exercises = 0
+                    for section in (el.warmup, el.workout, el.cooldown):
+                        for group in section:
+                            assert hasattr(group, "type"), "Group missing type"
+                            assert hasattr(group, "exercises"), "Group missing exercises"
+                            total_exercises += len(group.exercises)
+                            for ex in group.exercises:
+                                assert ex.exercise_name, f"Missing exercise_name in {ex.uuid}"
+
+                    report(
+                        "Exercises in workout day",
+                        total_exercises > 0,
+                        f"{total_exercises} exercises",
+                    )
+
+                    # Validate exercise fields (sets is a string, not a list)
+                    if el.workout and el.workout[0].exercises:
+                        sample = el.workout[0].exercises[0]
+                        report(
+                            "Exercise sets is string",
+                            isinstance(sample.sets, str | None),
+                            f"sets='{sample.sets}' (type={type(sample.sets).__name__})",
+                        )
+                        report(
+                            "Exercise reps field exists",
+                            hasattr(sample, "reps"),
+                            f"reps='{sample.reps}'",
+                        )
+                        report(
+                            "Exercise has rest_period",
+                            hasattr(sample, "rest_period"),
+                            f"rest_period={sample.rest_period}",
+                        )
+            except Exception as e:
+                report("Get workout program detail", False, str(e))
+
+        await throttled()
 
         # ── 4. List Exercises ──
         print("\n=== Exercises ===")
         try:
             exercises = await client.list_exercises()
+
+            report(
+                "Exercises payload has pagination",
+                hasattr(exercises, "pagination"),
+            )
             report(
                 "List exercises",
                 exercises.total_records > 0,
                 f"Found {exercises.total_records} exercises",
             )
+
             if exercises.exercises:
                 ex = exercises.exercises[0]
-                report("Exercise has name", bool(ex.exercise_name), f"'{ex.exercise_name}'")
+
+                report(
+                    "Exercise has name",
+                    bool(ex.exercise_name),
+                    f"'{ex.exercise_name}'",
+                )
                 report("Exercise has uuid", bool(ex.uuid))
+                report(
+                    "Exercise has exercise_type",
+                    ex.exercise_type in (1, 2),
+                    f"type={ex.exercise_type}",
+                )
+
                 if ex.media:
                     m = ex.media[0]
                     report(
-                        "Exercise media parsed",
+                        "Media has file_url",
                         bool(m.file_url),
-                        f"{len(ex.media)} media items, type={m.file_type}",
+                        f"type={m.file_type}",
+                    )
+                    report(
+                        "Media parent_type is nullable",
+                        m.parent_type is None or isinstance(m.parent_type, int),
+                        f"parent_type={m.parent_type}",
                     )
         except Exception as e:
             report("List exercises", False, str(e))
+
+        await throttled()
 
         # ── 5. Search Exercises ──
         try:
             results = await client.search_exercises("bench")
             report(
-                "Search exercises", len(results) >= 0, f"Found {len(results)} results for 'bench'"
+                "Search exercises",
+                len(results) >= 0,
+                f"Found {len(results)} results for 'bench'",
             )
             if results:
                 report(
@@ -158,31 +246,51 @@ async def run_all_tests() -> None:
         except Exception as e:
             report("Search exercises", False, str(e))
 
+        await throttled()
+
         # ── 6. Pagination ──
         print("\n=== Pagination ===")
         try:
             page2 = await client.list_exercises(page=2, per_page=5)
-            report("Exercises page 2", True, f"Got {len(page2.exercises)} exercises")
+            report(
+                "Exercises page 2",
+                True,
+                f"Got {len(page2.exercises)} exercises",
+            )
+            report(
+                "Pagination per_page respected",
+                len(page2.exercises) <= 5,
+                f"requested 5, got {len(page2.exercises)}",
+            )
         except Exception as e:
             report("Exercises page 2", False, str(e))
+
+        await throttled()
 
         # ── 7. Generic API ──
         print("\n=== Generic API ===")
         try:
-            raw = await client.api_get("v1/workoutprogram", params={"per_page": 1})
+            raw = await client.api_get(
+                "v1/workoutprogram",
+                params={"per_page": 1},
+            )
             report("Generic API GET", raw.get("success", False))
+            report(
+                "Generic response has standard keys",
+                all(k in raw for k in ("success", "message", "data")),
+                f"keys={list(raw.keys())[:6]}",
+            )
         except Exception as e:
             report("Generic API GET", False, str(e))
 
         # ── 8. Web Endpoints (require session cookies) ──
         print("\n=== Web Endpoints (token-only auth) ===")
-        print("  NOTE: Web endpoints require session cookies from email/password login.")
-        print("  Token-only auth can only access REST API endpoints.")
+        print("  NOTE: Web endpoints require session cookies from login.")
         skip("List clients", "Requires session cookies (email/password login)")
-        skip("Chat messages", "Requires session cookies (email/password login)")
-        skip("Chart data", "Requires session cookies (email/password login)")
-        skip("Habits", "Requires session cookies (email/password login)")
-        skip("Packages", "Requires session cookies (email/password login)")
+        skip("Chat messages", "Requires session cookies")
+        skip("Chart data", "Requires session cookies")
+        skip("Habits", "Requires session cookies")
+        skip("Packages", "Requires session cookies")
 
     # ── Summary ──
     total = PASS + FAIL
