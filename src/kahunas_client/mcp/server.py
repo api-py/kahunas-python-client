@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -526,8 +528,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             safe_name = client_name.replace(" ", "_") or client_uuid[:8]
             output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
 
-        # Generate the chart
-        png_bytes = generate_chart(
+        # Generate the chart (blocking I/O — run in thread pool)
+        png_bytes = await asyncio.to_thread(
+            generate_chart,
             data_points=data_points,
             metric=metric,
             time_range=time_range,
@@ -815,8 +818,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         if not output_path:
             output_path = f"/tmp/kahunas_appointments_{time_range}.ics"
 
-        with open(output_path, "w") as f:
-            f.write(ics_content)
+        await asyncio.to_thread(Path(output_path).write_text, ics_content)
 
         return _compact(
             {
@@ -1536,7 +1538,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             safe_name = client_name.replace(" ", "_") or client_uuid[:8]
             output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
 
-        png_bytes = generate_chart(
+        png_bytes = await asyncio.to_thread(
+            generate_chart,
             data_points=chart_data,
             metric=metric,
             time_range=time_range,
@@ -1678,7 +1681,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 f"~/kahunas_exports/{program_data.get('name', uuid)}_program.pdf"
             )
 
-        path = export_workout_program_pdf(program_data, output_path)
+        path = await asyncio.to_thread(export_workout_program_pdf, program_data, output_path)
         return _compact({"status": "exported", "path": str(path)})
 
     @mcp.tool()
@@ -1717,7 +1720,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 f"~/kahunas_exports/{client_name.replace(' ', '_')}_checkins.pdf"
             )
 
-        path = export_checkin_summary_pdf(
+        path = await asyncio.to_thread(
+            export_checkin_summary_pdf,
             summary_data,
             output_path,
             weight_unit=config.weight_unit,
@@ -1750,7 +1754,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 f"~/kahunas_exports/{client_name.replace(' ', '_')}_plan.pdf"
             )
 
-        path = export_workout_plan_pdf(plan_data, output_path)
+        path = await asyncio.to_thread(export_workout_plan_pdf, plan_data, output_path)
         return _compact({"status": "exported", "path": str(path)})
 
     # ── Check-in Reminder Tools ──

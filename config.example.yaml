@@ -1,0 +1,63 @@
+# Kahunas Python Client — Example Configuration (UK)
+#
+# Copy this file to config.yaml and fill in your credentials.
+# Then set KAHUNAS_CONFIG_FILE=config.yaml as an environment variable,
+# or load it directly with KahunasConfig.from_yaml("config.yaml").
+#
+# All values shown below are the defaults unless noted otherwise.
+# Remove or comment out any line to use the default value.
+
+# ── Authentication ──
+email: "you@example.com"            # Your Kahunas coach account email
+password: "your-password"            # Your Kahunas coach account password
+# auth_token: ""                     # Pre-existing auth token (skips login if set)
+
+# ── API Settings ──
+api_base_url: "https://api.kahunas.io/api"
+web_base_url: "https://kahunas.io"
+timeout: 30.0                        # HTTP request timeout (seconds)
+max_retries: 3                       # Max retry attempts for failed requests
+retry_base_delay: 1.0                # Base delay between retries (seconds)
+
+# ── Measurement Units (match your Kahunas coach/configuration page) ──
+weight_unit: "kg"                    # "kg" or "lbs"
+height_unit: "cm"                    # "cm" or "inches"
+glucose_unit: "mmol_l"               # "mmol_l" (UK standard) or "mg_dl"
+food_unit: "grams"                   # "grams", "ounces", "qty", "cups", "oz", "ml", "tsp"
+water_unit: "ml"                     # "ml", "l", or "oz"
+
+# ── Timezone ──
+timezone: "Europe/London"            # IANA timezone for appointments and scheduling
+
+# ── Calendar Sync ──
+calendar_prefix: "PT Session"        # Prefix for calendar event titles
+default_gym: "PureGym London"        # Default gym/location for appointments
+gym_list: "PureGym London,The Gym Group,Home,Outdoor"   # Available locations
+calendar_default_duration: 60        # Default appointment duration (minutes)
+
+# ── WhatsApp Business API ──
+# Leave blank if not using WhatsApp integration.
+whatsapp_token: ""                   # WhatsApp Cloud API access token
+whatsapp_phone_number_id: ""         # WhatsApp Business phone number ID
+whatsapp_default_country_code: "44"  # UK country code (44)
+
+# ── Check-in Reminders ──
+checkin_reminder_days: 7             # Days since last check-in before client is overdue
+
+# ── Anomaly Detection Thresholds ──
+# Triggers warnings when a client's metrics change significantly between check-ins.
+anomaly_weight_pct: 20.0             # Weight % change to flag as anomaly (e.g. 20 = 20%)
+anomaly_body_pct: 15.0              # Body measurement % change threshold (waist/hips/biceps/thighs)
+anomaly_lifestyle_abs: 3.0           # Lifestyle rating (1-10 scale) absolute change threshold
+anomaly_window_days: 7               # Lookback window for comparing consecutive check-ins (days)
+anomaly_sleep_minimum: 7.0           # Sleep quality score below which to flag a warning
+anomaly_step_minimum: 5000           # Daily step count below which to flag a warning
+
+# ── Messaging Persona ──
+# Controls the tone and style of automated messages to clients.
+# The default persona is a London-based PT with 15 years experience, British English.
+persona_template: ""                 # Inline persona template (leave blank for default)
+persona_template_path: ""            # Path to a custom persona template file (highest priority)
+persona_weight_deviation_pct: 20.0   # Weight deviation % to highlight in messages
+persona_sleep_minimum: 7.0           # Sleep hours below which messages highlight concern
+persona_step_minimum: 5000           # Step count below which messages highlight concern

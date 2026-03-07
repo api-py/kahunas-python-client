@@ -104,19 +104,12 @@ KAHUNAS_TIMEZONE=America/New_York
 
 ### 3. YAML Config File
 
-```yaml
-# config.yaml
-email: you@example.com
-password: your-password
-timeout: 60.0
-whatsapp_token: your-meta-cloud-api-token
-whatsapp_phone_number_id: your-whatsapp-phone-number-id
-whatsapp_default_country_code: "44"
-calendar_prefix: "PT"
-default_gym: "PureGym"
-weight_unit: "lbs"
-height_unit: "inches"
-timezone: "Europe/London"
+A full example config for UK-based coaches is provided at [`config.example.yaml`](config.example.yaml).
+Copy and customise it:
+
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml with your credentials and preferences
 ```
 
 Point to it via env var:
