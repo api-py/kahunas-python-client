@@ -432,6 +432,21 @@ class KahunasClient:
             "POST", "/packageAction", data={"action": action, "id": package_id, **kwargs}
         )
 
+    # ── Web App: Check-in History ──
+
+    async def list_client_checkins(self, client_uuid: str) -> httpx.Response:
+        """Fetch check-in history for a client.
+
+        Returns the client view page data which includes check-in records.
+        The response typically contains the full client profile with embedded
+        check-in data.
+        """
+        return await self._web_request(
+            "POST",
+            "/coach/clientAction",
+            data={"action": "view", "id": client_uuid},
+        )
+
     # ── Web App: Calendar ──
 
     async def delete_calendar_event(self, event_id: str) -> httpx.Response:
