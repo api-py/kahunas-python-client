@@ -10,6 +10,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from ..anomaly_detection import parse_thresholds, scan_client_anomalies
+from ..checkin_reminders import build_reminder_message, find_overdue_clients
 from ..client import KahunasClient
 from ..config import KahunasConfig
 from ..metrics_store import (
@@ -20,6 +22,13 @@ from ..metrics_store import (
 from ..metrics_store import (
     METRICS as METRIC_DEFINITIONS,
 )
+from ..pdf_export import (
+    export_checkin_summary_pdf,
+    export_workout_plan_pdf,
+    export_workout_program_pdf,
+)
+from ..persona import PersonaConfig, build_anomaly_warning, get_persona_summary
+from ..phone_alignment import build_phone_alignment_report
 from .export import ExportManager
 
 logger = logging.getLogger(__name__)
@@ -1608,5 +1617,491 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         export = _get_export()
         path = await export.export_workout_programs(output_dir=output_dir or None)
         return _compact({"status": "exported", "path": str(path)})
+
+    # ── Phone Alignment Tools ──
+
+    @mcp.tool()
+    async def phone_alignment_report(country_code: str = "44") -> str:
+        """Show phone alignment between Kahunas client data and WhatsApp E.164 format.
+
+        Compares stored phone numbers with their normalised WhatsApp equivalents.
+        Identifies aligned, mismatched, and missing numbers so you can fix them.
+        """
+        client = _get_client()
+        resp = await client.list_clients()
+        try:
+            clients_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch clients"})
+
+        raw_clients = (
+            clients_data if isinstance(clients_data, list) else clients_data.get("data", [])
+        )
+        report = build_phone_alignment_report(raw_clients, country_code)
+        return _compact(report)
+
+    @mcp.tool()
+    async def update_client_phone(client_uuid: str, phone: str) -> str:
+        """Update a client's phone number in Kahunas.
+
+        Use after running phone_alignment_report to fix mismatched numbers.
+        """
+        client = _get_client()
+        resp = await client.get_client_action("edit", client_uuid, phone=phone)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"status": resp.status_code, "text": resp.text[:200]}
+        return _compact(
+            {
+                "status": "updated",
+                "client_uuid": client_uuid,
+                "phone": phone,
+                "response": data,
+            }
+        )
+
+    # ── PDF Export Tools ──
+
+    @mcp.tool()
+    async def export_workout_program_to_pdf(uuid: str, output_path: str = "") -> str:
+        """Export a workout program as a professionally formatted PDF.
+
+        Includes exercise tables with sets, reps, rest, and tempo per day.
+        """
+        client = _get_client()
+        program = await client.get_workout_program(uuid)
+        program_data = program.model_dump()
+
+        if not output_path:
+            output_path = os.path.expanduser(
+                f"~/kahunas_exports/{program_data.get('name', uuid)}_program.pdf"
+            )
+
+        path = export_workout_program_pdf(program_data, output_path)
+        return _compact({"status": "exported", "path": str(path)})
+
+    @mcp.tool()
+    async def export_checkin_summary_to_pdf(
+        client_uuid: str,
+        client_name: str = "Client",
+        output_path: str = "",
+    ) -> str:
+        """Export a client's check-in history as a PDF with metrics table and trends."""
+        from ..checkin_history import format_checkin_summary
+
+        client = _get_client()
+        config = client._config
+
+        resp = await client.list_client_checkins(client_uuid)
+        try:
+            raw_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch check-in data"})
+
+        summary = format_checkin_summary(
+            raw_data,
+            client_name=client_name,
+            weight_unit=config.weight_unit,
+            measurement_unit=config.height_unit,
+        )
+
+        summary_data = {
+            "client_name": client_name,
+            "checkins": summary.get("checkins", []),
+            "trends": summary.get("trends"),
+        }
+
+        if not output_path:
+            output_path = os.path.expanduser(
+                f"~/kahunas_exports/{client_name.replace(' ', '_')}_checkins.pdf"
+            )
+
+        path = export_checkin_summary_pdf(
+            summary_data,
+            output_path,
+            weight_unit=config.weight_unit,
+            measurement_unit=config.height_unit,
+        )
+        return _compact({"status": "exported", "path": str(path)})
+
+    @mcp.tool()
+    async def export_workout_plan_to_pdf(client_uuid: str, output_path: str = "") -> str:
+        """Export a client's assigned workout plan as a formatted PDF."""
+        client = _get_client()
+        resp = await client.get_client_action("view", client_uuid)
+        try:
+            client_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch client data"})
+
+        # Extract workout plan from client view data
+        plan_data = client_data.get("workout_plan", client_data.get("plan", {}))
+        if not plan_data:
+            return _compact({"error": "No workout plan found for this client"})
+
+        first = client_data.get("first_name", "")
+        last = client_data.get("last_name", "")
+        client_name = f"{first} {last}".strip()
+        plan_data["client_name"] = client_name or "Client"
+
+        if not output_path:
+            output_path = os.path.expanduser(
+                f"~/kahunas_exports/{client_name.replace(' ', '_')}_plan.pdf"
+            )
+
+        path = export_workout_plan_pdf(plan_data, output_path)
+        return _compact({"status": "exported", "path": str(path)})
+
+    # ── Check-in Reminder Tools ──
+
+    @mcp.tool()
+    async def find_overdue_checkins(days: int = 7) -> str:
+        """Find clients who haven't checked in for the specified number of days.
+
+        Returns a list of overdue clients sorted by most overdue first,
+        with their last check-in date and days overdue.
+        """
+        client = _get_client()
+        resp = await client.list_clients()
+        try:
+            clients_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch clients"})
+
+        raw_clients = (
+            clients_data if isinstance(clients_data, list) else clients_data.get("data", [])
+        )
+
+        # Fetch check-in data for each client
+        checkins_by_client: dict[str, list[dict[str, Any]]] = {}
+        for c in raw_clients:
+            uuid = c.get("uuid", "")
+            if not uuid:
+                continue
+            try:
+                checkin_resp = await client.list_client_checkins(uuid)
+                checkin_data = checkin_resp.json()
+                checkins = checkin_data.get("check_ins", checkin_data.get("checkins", []))
+                if isinstance(checkins, list):
+                    checkins_by_client[uuid] = checkins
+            except Exception:
+                logger.debug("Could not fetch check-ins for client %s", uuid)
+
+        overdue = find_overdue_clients(
+            raw_clients,
+            checkins_by_client,
+            days_threshold=days,
+        )
+        return _compact(
+            {
+                "overdue_clients": overdue,
+                "threshold_days": days,
+                "total_overdue": len(overdue),
+            }
+        )
+
+    @mcp.tool()
+    async def send_checkin_reminders(
+        client_uuids: str,
+        via_chat: bool = True,
+        via_whatsapp: bool = False,
+        custom_message: str = "",
+    ) -> str:
+        """Send check-in reminders to specified clients via Kahunas chat and/or WhatsApp.
+
+        client_uuids: Comma-separated UUIDs of clients to remind.
+        """
+        from ..whatsapp import WhatsAppClient, WhatsAppConfig, normalise_phone
+
+        client = _get_client()
+        config = client._config
+        uuids = [u.strip() for u in client_uuids.split(",") if u.strip()]
+
+        persona = PersonaConfig.from_config(
+            persona_template=config.persona_template,
+            persona_template_path=config.persona_template_path,
+            weight_deviation_pct=config.persona_weight_deviation_pct,
+            sleep_minimum=config.persona_sleep_minimum,
+            step_minimum=config.persona_step_minimum,
+        )
+
+        results: list[dict[str, Any]] = []
+
+        for uuid in uuids:
+            entry: dict[str, Any] = {"uuid": uuid, "chat_sent": False, "whatsapp_sent": False}
+            try:
+                resp = await client.get_client_action("view", uuid)
+                client_data = resp.json()
+                first_name = client_data.get("first_name", "Client")
+                phone = client_data.get("phone", "")
+                entry["name"] = first_name
+
+                message = build_reminder_message(
+                    first_name,
+                    config.checkin_reminder_days,
+                    persona,
+                    custom_message,
+                )
+
+                if via_chat:
+                    try:
+                        await client.send_chat_message(
+                            {
+                                "receiver_uuid": uuid,
+                                "message": message,
+                            }
+                        )
+                        entry["chat_sent"] = True
+                    except Exception as exc:
+                        entry["chat_error"] = str(exc)
+
+                if via_whatsapp and phone:
+                    wa_config = WhatsAppConfig(
+                        access_token=config.whatsapp_token,
+                        phone_number_id=config.whatsapp_phone_number_id,
+                        default_country_code=config.whatsapp_default_country_code,
+                    )
+                    if wa_config.is_configured():
+                        normalised = normalise_phone(phone, config.whatsapp_default_country_code)
+                        if normalised:
+                            try:
+                                async with WhatsAppClient(wa_config) as wa:
+                                    await wa.send_text(normalised, message)
+                                entry["whatsapp_sent"] = True
+                            except Exception as exc:
+                                entry["whatsapp_error"] = str(exc)
+                    else:
+                        entry["whatsapp_error"] = "WhatsApp not configured"
+
+            except Exception as exc:
+                entry["error"] = str(exc)
+
+            results.append(entry)
+
+        return _compact({"reminders_sent": results, "total": len(results)})
+
+    # ── Anomaly Detection Tools ──
+
+    @mcp.tool()
+    async def detect_client_anomalies(client_uuid: str, client_name: str = "Client") -> str:
+        """Scan a single client's check-in data for anomalies and threshold breaches.
+
+        Detects significant changes in weight, body measurements, sleep,
+        stress, energy, and other metrics. Thresholds are configurable via
+        KAHUNAS_ANOMALY_* environment variables.
+        """
+        from ..checkin_history import format_checkin_summary
+
+        client = _get_client()
+        config = client._config
+
+        resp = await client.list_client_checkins(client_uuid)
+        try:
+            raw_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch check-in data"})
+
+        summary = format_checkin_summary(
+            raw_data,
+            client_name=client_name,
+            weight_unit=config.weight_unit,
+            measurement_unit=config.height_unit,
+        )
+        checkins = summary.get("checkins", [])
+
+        thresholds = parse_thresholds(
+            weight_pct=config.anomaly_weight_pct,
+            body_pct=config.anomaly_body_pct,
+            lifestyle_abs=config.anomaly_lifestyle_abs,
+        )
+
+        anomalies = scan_client_anomalies(
+            checkins,
+            thresholds=thresholds,
+            window_days=config.anomaly_window_days,
+            sleep_minimum=config.anomaly_sleep_minimum,
+            step_minimum=config.anomaly_step_minimum,
+        )
+
+        total_anomalies = sum(len(v) for v in anomalies.values())
+        return _compact(
+            {
+                "client": client_name,
+                "client_uuid": client_uuid,
+                "anomalies": anomalies,
+                "total_anomalies": total_anomalies,
+                "thresholds_used": {
+                    "weight_pct": config.anomaly_weight_pct,
+                    "body_pct": config.anomaly_body_pct,
+                    "lifestyle_abs": config.anomaly_lifestyle_abs,
+                    "window_days": config.anomaly_window_days,
+                },
+            }
+        )
+
+    @mcp.tool()
+    async def scan_all_client_anomalies() -> str:
+        """Scan ALL clients for check-in anomalies and threshold breaches.
+
+        Returns a summary of anomalies found across all clients.
+        Use detect_client_anomalies for detailed per-client analysis.
+        """
+        from ..checkin_history import format_checkin_summary
+
+        client = _get_client()
+        config = client._config
+
+        resp = await client.list_clients()
+        try:
+            clients_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch clients"})
+
+        raw_clients = (
+            clients_data if isinstance(clients_data, list) else clients_data.get("data", [])
+        )
+
+        thresholds = parse_thresholds(
+            weight_pct=config.anomaly_weight_pct,
+            body_pct=config.anomaly_body_pct,
+            lifestyle_abs=config.anomaly_lifestyle_abs,
+        )
+
+        results: list[dict[str, Any]] = []
+        for c in raw_clients:
+            uuid = c.get("uuid", "")
+            name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
+            if not uuid:
+                continue
+
+            try:
+                checkin_resp = await client.list_client_checkins(uuid)
+                raw_data = checkin_resp.json()
+                summary = format_checkin_summary(
+                    raw_data,
+                    client_name=name,
+                    weight_unit=config.weight_unit,
+                    measurement_unit=config.height_unit,
+                )
+                checkins = summary.get("checkins", [])
+                anomalies = scan_client_anomalies(
+                    checkins,
+                    thresholds=thresholds,
+                    window_days=config.anomaly_window_days,
+                    sleep_minimum=config.anomaly_sleep_minimum,
+                    step_minimum=config.anomaly_step_minimum,
+                )
+                if anomalies:
+                    total = sum(len(v) for v in anomalies.values())
+                    results.append(
+                        {
+                            "client": name,
+                            "uuid": uuid,
+                            "anomaly_count": total,
+                            "metrics_affected": list(anomalies.keys()),
+                        }
+                    )
+            except Exception:
+                logger.debug("Could not scan anomalies for client %s", uuid)
+
+        results.sort(key=lambda x: x.get("anomaly_count", 0), reverse=True)
+        return _compact(
+            {
+                "clients_with_anomalies": results,
+                "total_clients_scanned": len(raw_clients),
+                "clients_with_issues": len(results),
+            }
+        )
+
+    # ── Persona / Template Tools ──
+
+    @mcp.tool()
+    async def get_messaging_persona() -> str:
+        """Show the current messaging persona configuration and template.
+
+        Displays the active template source (default/custom), thresholds
+        for highlighting weight deviations, sleep deprivation, and low
+        step count in client messages.
+        """
+        client = _get_client()
+        config = client._config
+
+        persona = PersonaConfig.from_config(
+            persona_template=config.persona_template,
+            persona_template_path=config.persona_template_path,
+            weight_deviation_pct=config.persona_weight_deviation_pct,
+            sleep_minimum=config.persona_sleep_minimum,
+            step_minimum=config.persona_step_minimum,
+        )
+
+        return _compact(get_persona_summary(persona))
+
+    @mcp.tool()
+    async def preview_client_message(
+        client_uuid: str,
+        message_type: str = "reminder",
+        custom_context: str = "",
+    ) -> str:
+        """Preview what a message to a client would look like.
+
+        message_type: 'reminder' for check-in reminder, 'anomaly' for anomaly warning.
+        """
+        from ..checkin_history import format_checkin_summary
+
+        client = _get_client()
+        config = client._config
+
+        resp = await client.get_client_action("view", client_uuid)
+        try:
+            client_data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch client data"})
+
+        first_name = client_data.get("first_name", "Client")
+
+        persona = PersonaConfig.from_config(
+            persona_template=config.persona_template,
+            persona_template_path=config.persona_template_path,
+            weight_deviation_pct=config.persona_weight_deviation_pct,
+            sleep_minimum=config.persona_sleep_minimum,
+            step_minimum=config.persona_step_minimum,
+        )
+
+        if message_type == "anomaly":
+            # Fetch anomaly data for preview
+            checkin_resp = await client.list_client_checkins(client_uuid)
+            try:
+                raw_data = checkin_resp.json()
+            except Exception:
+                return _compact({"error": "Could not fetch check-in data"})
+
+            summary = format_checkin_summary(
+                raw_data,
+                client_name=first_name,
+                weight_unit=config.weight_unit,
+                measurement_unit=config.height_unit,
+            )
+            checkins = summary.get("checkins", [])
+            thresholds = parse_thresholds(
+                weight_pct=config.anomaly_weight_pct,
+                body_pct=config.anomaly_body_pct,
+                lifestyle_abs=config.anomaly_lifestyle_abs,
+            )
+            anomalies_data = scan_client_anomalies(checkins, thresholds=thresholds)
+            flat_anomalies = [a for alist in anomalies_data.values() for a in alist]
+            message = build_anomaly_warning(first_name, flat_anomalies, persona, custom_context)
+        else:
+            message = build_reminder_message(
+                first_name, config.checkin_reminder_days, persona, custom_context
+            )
+
+        return _compact(
+            {
+                "message_type": message_type,
+                "client": first_name,
+                "message_preview": message,
+            }
+        )
 
     return mcp
