@@ -12,12 +12,25 @@ from fastmcp import FastMCP
 
 from ..client import KahunasClient
 from ..config import KahunasConfig
+from ..metrics_store import (
+    MEASUREMENT_SETTINGS,
+    MetricsStore,
+    get_metrics_with_units,
+)
+from ..metrics_store import (
+    METRICS as METRIC_DEFINITIONS,
+)
 from .export import ExportManager
 
 logger = logging.getLogger(__name__)
 
 _client: KahunasClient | None = None
 _export: ExportManager | None = None
+_metrics: MetricsStore | None = None
+
+# Constants to avoid string duplication (SonarQube S1192)
+_CALENDAR_EVENTS_PATH = "/coach/getCalendarEvents"
+_CALENDAR_FETCH_ERROR = "Could not fetch calendar events"
 
 
 def _get_client() -> KahunasClient:
@@ -30,6 +43,13 @@ def _get_export() -> ExportManager:
     if _export is None:
         raise RuntimeError("Export manager not initialized — call login() first")
     return _export
+
+
+def _get_metrics() -> MetricsStore:
+    global _metrics
+    if _metrics is None:
+        _metrics = MetricsStore()
+    return _metrics
 
 
 def _compact(data: Any) -> str:
@@ -81,7 +101,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         "kahunas",
         instructions=(
             "Kahunas fitness coaching platform — manage clients, "
-            "workouts, exercises, check-ins, charts, and WhatsApp messaging."
+            "workouts, exercises, check-ins, charts, WhatsApp messaging, "
+            "and calendar sync (Google Calendar / Apple iCal)."
         ),
     )
 
@@ -107,11 +128,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     @mcp.tool()
     async def logout() -> str:
         """Close the Kahunas session."""
-        global _client, _export
+        global _client, _export, _metrics
         if _client:
             await _client.__aexit__(None, None, None)
             _client = None
             _export = None
+        if _metrics:
+            _metrics.close()
+            _metrics = None
         return '{"status":"logged_out"}'
 
     # ── Workout Programs ──
@@ -304,6 +328,59 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         """Compare check-in data over time."""
         resp = await _get_client().compare_checkins(checkin_uuid)
         return resp.text
+
+    @mcp.tool()
+    async def checkin_summary(client_uuid: str, client_name: str = "") -> str:
+        """Get a tabular check-in history summary for a client.
+
+        Returns a structured table of all check-ins with body measurements
+        (weight, waist, hips, biceps, thighs) and lifestyle ratings
+        (sleep, nutrition, water, workouts, stress, energy, mood).
+
+        Similar to the Check In History table on the Kahunas dashboard.
+        Includes trend analysis showing changes between check-ins.
+
+        Units are automatically configured from your measurement settings
+        (KAHUNAS_WEIGHT_UNIT, KAHUNAS_HEIGHT_UNIT).
+        """
+        from ..checkin_history import format_checkin_summary
+
+        cfg = config or KahunasConfig.from_env()
+
+        # Fetch client data (includes check-ins)
+        resp = await _get_client().list_client_checkins(client_uuid)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not parse check-in data", "raw": resp.text[:200]})
+
+        # Extract check-ins from response
+        checkins: list[dict[str, Any]] = []
+        if isinstance(data, dict):
+            checkins = data.get("checkins", data.get("check_ins", data.get("data", [])))
+            if isinstance(checkins, dict):
+                checkins = checkins.get("checkins", checkins.get("check_ins", []))
+        elif isinstance(data, list):
+            checkins = data
+
+        if not checkins:
+            return _compact(
+                {
+                    "client_uuid": client_uuid,
+                    "client_name": client_name or None,
+                    "total_checkins": 0,
+                    "message": "No check-ins found for this client",
+                }
+            )
+
+        measurement_unit = "inches" if cfg.height_unit == "inches" else "cm"
+        summary = format_checkin_summary(
+            checkins,
+            client_name=client_name,
+            weight_unit=cfg.weight_unit,
+            measurement_unit=measurement_unit,
+        )
+        return _compact(summary)
 
     # ── Habits ──
 
@@ -591,6 +668,882 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 "clients": summary,
                 "total": len(summary),
                 "whatsapp_ready": ready_count,
+            }
+        )
+
+    # ── Calendar Sync ──
+
+    @mcp.tool()
+    async def list_appointments(
+        time_range: str = "next_7d",
+    ) -> str:
+        """List Kahunas appointments, optionally filtered by time range.
+
+        Time ranges: today, next_24h, next_48h, next_7d, next_month,
+        next_3m, next_6m, next_12m.
+
+        Returns appointments with Kahunas UUIDs for calendar sync.
+        """
+        from ..calendar_sync import CalendarConfig, filter_appointments_by_range, parse_time_range
+
+        cfg = config or KahunasConfig.from_env()
+        cal_config = CalendarConfig(
+            prefix=cfg.calendar_prefix,
+            default_gym=cfg.default_gym,
+            default_duration_minutes=cfg.calendar_default_duration,
+        )
+
+        # Fetch Kahunas calendar events via web endpoint
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR, "raw": resp.text[:200]})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        # Filter by time range
+        try:
+            start_dt, end_dt = parse_time_range(time_range)
+            events = filter_appointments_by_range(events, start_dt, end_dt, date_field="start")
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        # Format for LLM consumption
+        appointments = []
+        for evt in events:
+            appt: dict[str, Any] = {
+                "uuid": evt.get("id", evt.get("uuid", "")),
+                "title": evt.get("title", ""),
+                "start": evt.get("start", ""),
+                "end": evt.get("end", ""),
+            }
+            if evt.get("client_name"):
+                appt["client"] = evt["client_name"]
+            if cal_config.default_gym:
+                appt["location"] = cal_config.default_gym
+            appointments.append(appt)
+
+        return _compact(
+            {
+                "appointments": appointments,
+                "count": len(appointments),
+                "range": time_range,
+                "prefix": cal_config.prefix,
+            }
+        )
+
+    @mcp.tool()
+    async def sync_appointments_ics(
+        time_range: str = "next_7d",
+        output_path: str = "",
+    ) -> str:
+        """Generate an iCal (.ics) file for Apple Calendar from Kahunas appointments.
+
+        Exports appointments for the given time range to an .ics file that
+        can be imported into Apple Calendar, Outlook, or any iCal-compatible app.
+
+        Each event embeds the Kahunas UUID for safe add/edit/remove tracking.
+
+        Time ranges: today, next_24h, next_48h, next_7d, next_month,
+        next_3m, next_6m, next_12m.
+        """
+        from ..calendar_sync import (
+            CalendarConfig,
+            filter_appointments_by_range,
+            generate_ics,
+            parse_time_range,
+        )
+
+        cfg = config or KahunasConfig.from_env()
+        cal_config = CalendarConfig(
+            prefix=cfg.calendar_prefix,
+            default_gym=cfg.default_gym,
+            default_duration_minutes=cfg.calendar_default_duration,
+        )
+
+        # Fetch Kahunas events
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        # Filter by time range
+        try:
+            start_dt, end_dt = parse_time_range(time_range)
+            events = filter_appointments_by_range(events, start_dt, end_dt, date_field="start")
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        # Map to appointment dicts
+        appointments = []
+        for evt in events:
+            appointments.append(
+                {
+                    "uuid": evt.get("id", evt.get("uuid", "")),
+                    "client_name": evt.get("client_name", evt.get("title", "Client")),
+                    "start_time": evt.get("start", ""),
+                    "end_time": evt.get("end", ""),
+                    "notes": evt.get("description", ""),
+                    "location": evt.get("location", ""),
+                }
+            )
+
+        # Generate .ics
+        ics_content = generate_ics(appointments, cal_config)
+
+        if not output_path:
+            output_path = f"/tmp/kahunas_appointments_{time_range}.ics"
+
+        with open(output_path, "w") as f:
+            f.write(ics_content)
+
+        return _compact(
+            {
+                "status": "exported",
+                "path": output_path,
+                "events": len(appointments),
+                "range": time_range,
+                "format": "iCal (.ics)",
+            }
+        )
+
+    @mcp.tool()
+    async def format_appointments_gcal(
+        time_range: str = "next_7d",
+    ) -> str:
+        """Format Kahunas appointments as Google Calendar event objects.
+
+        Returns a list of event objects ready for the Google Calendar API.
+        Each event includes the Kahunas UUID in extendedProperties for
+        safe tracking, and the title follows the configured prefix format.
+
+        Time ranges: today, next_24h, next_48h, next_7d, next_month,
+        next_3m, next_6m, next_12m.
+        """
+        from ..calendar_sync import (
+            CalendarConfig,
+            filter_appointments_by_range,
+            format_for_google_calendar,
+            parse_time_range,
+        )
+
+        cfg = config or KahunasConfig.from_env()
+        cal_config = CalendarConfig(
+            prefix=cfg.calendar_prefix,
+            default_gym=cfg.default_gym,
+            default_duration_minutes=cfg.calendar_default_duration,
+        )
+
+        # Fetch Kahunas events
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        # Filter by time range
+        try:
+            start_dt, end_dt = parse_time_range(time_range)
+            events = filter_appointments_by_range(events, start_dt, end_dt, date_field="start")
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        # Map to appointment dicts
+        appointments = []
+        for evt in events:
+            appointments.append(
+                {
+                    "uuid": evt.get("id", evt.get("uuid", "")),
+                    "client_name": evt.get("client_name", evt.get("title", "Client")),
+                    "start_time": evt.get("start", ""),
+                    "end_time": evt.get("end", ""),
+                    "notes": evt.get("description", ""),
+                    "location": evt.get("location", ""),
+                }
+            )
+
+        gcal_events = format_for_google_calendar(appointments, cal_config)
+        return _compact(
+            {
+                "events": gcal_events,
+                "count": len(gcal_events),
+                "range": time_range,
+                "prefix": cal_config.prefix,
+            }
+        )
+
+    @mcp.tool()
+    async def find_client_appointments(
+        client_uuid: str,
+        client_name: str = "",
+        time_range: str = "next_12m",
+    ) -> str:
+        """Find all calendar appointments for a specific client.
+
+        Searches Kahunas calendar events for a client by UUID or name.
+        Returns matching appointments with their Kahunas UUIDs for
+        editing or removal.
+
+        Time ranges: today, next_24h, next_48h, next_7d, next_month,
+        next_3m, next_6m, next_12m.
+        """
+        from ..calendar_sync import filter_appointments_by_range, parse_time_range
+
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        # Filter by time range
+        try:
+            start_dt, end_dt = parse_time_range(time_range)
+            events = filter_appointments_by_range(events, start_dt, end_dt, date_field="start")
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        # Match by client UUID or name
+        matched = []
+        search_name = client_name.lower()
+        for evt in events:
+            evt_client = evt.get("client_uuid", evt.get("client_id", ""))
+            evt_title = evt.get("title", "").lower()
+            evt_name = evt.get("client_name", "").lower()
+
+            if (
+                evt_client == client_uuid
+                or (search_name and search_name in evt_title)
+                or (search_name and search_name in evt_name)
+            ):
+                matched.append(
+                    {
+                        "uuid": evt.get("id", evt.get("uuid", "")),
+                        "title": evt.get("title", ""),
+                        "start": evt.get("start", ""),
+                        "end": evt.get("end", ""),
+                        "client": evt.get("client_name", ""),
+                    }
+                )
+
+        return _compact(
+            {
+                "appointments": matched,
+                "count": len(matched),
+                "client_uuid": client_uuid,
+                "client_name": client_name,
+            }
+        )
+
+    @mcp.tool()
+    async def appointment_overview() -> str:
+        """Get a comprehensive overview of all appointments across time windows.
+
+        Shows upcoming appointments (rest of today, tomorrow, rest of week,
+        rest of month) and historical counts (last week, 1/3/6 months, year,
+        all time). Also shows per-client appointment counts.
+
+        Use this tool to quickly see what's coming up and review scheduling
+        patterns.
+        """
+        from ..checkin_history import build_appointment_overview
+
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        overview = build_appointment_overview(events)
+        return _compact(overview)
+
+    @mcp.tool()
+    async def client_appointment_counts(
+        client_uuid: str,
+        client_name: str = "",
+    ) -> str:
+        """Get appointment counts for a specific client across time windows.
+
+        Shows how many appointments a client has had in the last week,
+        1 month, 3 months, 6 months, last year, and all time.
+
+        Useful for reviewing training frequency and client engagement.
+        """
+        from ..checkin_history import build_client_appointment_counts
+
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        counts = build_client_appointment_counts(events, client_uuid, client_name)
+        return _compact(counts)
+
+    @mcp.tool()
+    async def sync_calendar(
+        mode: str = "preview",
+        time_range: str = "next_3m",
+        calendar_type: str = "google",
+    ) -> str:
+        """Sync Kahunas appointments with your calendar (Google or Apple).
+
+        Modes:
+            preview  — Show what would be added/removed/updated (default, safe)
+            add      — Add new Kahunas appointments not yet in calendar
+            remove   — Remove calendar events for deleted Kahunas appointments
+            sync     — Full two-way sync: add new + remove deleted
+            trust    — Trust all: sync everything without individual confirmation
+
+        Calendar types: google, apple (ics)
+
+        Time ranges: today, next_24h, next_48h, next_7d, next_month,
+        next_3m, next_6m, next_12m.
+
+        For Google Calendar: Returns event objects ready for the API.
+        For Apple Calendar: Generates an .ics file for import.
+
+        In 'preview' mode, returns a summary of pending changes.
+        The AI assistant should present these to the user for confirmation
+        before switching to 'add', 'remove', or 'sync' mode.
+        """
+        from ..calendar_sync import (
+            CalendarConfig,
+            filter_appointments_by_range,
+            format_for_google_calendar,
+            generate_ics,
+            parse_time_range,
+        )
+
+        cfg = config or KahunasConfig.from_env()
+        cal_config = CalendarConfig(
+            prefix=cfg.calendar_prefix,
+            default_gym=cfg.default_gym,
+            default_duration_minutes=cfg.calendar_default_duration,
+        )
+
+        # Validate mode
+        valid_modes = ("preview", "add", "remove", "sync", "trust")
+        if mode not in valid_modes:
+            return _compact({"error": f"Invalid mode: '{mode}'. Use: {', '.join(valid_modes)}"})
+
+        # Fetch Kahunas events
+        resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": _CALENDAR_FETCH_ERROR})
+
+        events = []
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            events = data.get("data", data.get("events", []))
+
+        # Filter by time range
+        try:
+            start_dt, end_dt = parse_time_range(time_range)
+            events = filter_appointments_by_range(events, start_dt, end_dt, date_field="start")
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        # Map to appointment dicts
+        appointments = []
+        for evt in events:
+            appointments.append(
+                {
+                    "uuid": evt.get("id", evt.get("uuid", "")),
+                    "client_name": evt.get("client_name", evt.get("title", "Client")),
+                    "start_time": evt.get("start", ""),
+                    "end_time": evt.get("end", ""),
+                    "notes": evt.get("description", ""),
+                    "location": evt.get("location", ""),
+                }
+            )
+
+        result: dict[str, Any] = {
+            "mode": mode,
+            "calendar_type": calendar_type,
+            "time_range": time_range,
+            "total_appointments": len(appointments),
+        }
+
+        if mode == "preview":
+            # Show what would be synced
+            result["appointments"] = [
+                {
+                    "uuid": a["uuid"],
+                    "client": a["client_name"],
+                    "start": a["start_time"],
+                    "end": a["end_time"],
+                    "location": a.get("location") or None,
+                }
+                for a in appointments
+            ]
+            result["message"] = (
+                f"Found {len(appointments)} appointments in the '{time_range}' range. "
+                f"Use mode='sync' to add all to {calendar_type} calendar, "
+                f"or mode='add'/'remove' for granular control."
+            )
+        elif mode in ("add", "sync", "trust"):
+            if calendar_type == "apple":
+                ics_content = generate_ics(appointments, cal_config)
+                # Save to temp file
+                ics_path = f"/tmp/kahunas_sync_{time_range}.ics"
+                try:
+                    with open(ics_path, "w") as f:
+                        f.write(ics_content)
+                    result["ics_file"] = ics_path
+                    result["message"] = (
+                        f"Generated .ics file with {len(appointments)} appointments. "
+                        f"Import {ics_path} into Apple Calendar."
+                    )
+                except OSError as exc:
+                    result["error"] = f"Could not write .ics file: {exc}"
+            else:
+                # Google Calendar format
+                gcal_events = format_for_google_calendar(appointments, cal_config)
+                result["events"] = gcal_events
+                result["message"] = (
+                    f"Formatted {len(gcal_events)} appointments for Google Calendar API. "
+                    "Use these event objects with gcal_create_event to add them."
+                )
+        elif mode == "remove":
+            # List appointments that could be removed
+            result["removable"] = [
+                {"uuid": a["uuid"], "client": a["client_name"], "start": a["start_time"]}
+                for a in appointments
+            ]
+            result["message"] = (
+                f"Found {len(appointments)} appointments that can be removed. "
+                "Use the UUIDs with your calendar's delete API."
+            )
+
+        return _compact(result)
+
+    # ── Gym / Location Management ──
+
+    @mcp.tool()
+    async def list_gyms() -> str:
+        """List configured gyms/locations for calendar appointments.
+
+        Returns the default gym and the full list of available gyms.
+        Configure via KAHUNAS_GYM_LIST (comma-separated) and
+        KAHUNAS_DEFAULT_GYM environment variables.
+        """
+        cfg = config or KahunasConfig.from_env()
+        gym_list = [g.strip() for g in cfg.gym_list.split(",") if g.strip()] if cfg.gym_list else []
+        return _compact(
+            {
+                "default_gym": cfg.default_gym or None,
+                "gyms": gym_list if gym_list else None,
+                "prefix": cfg.calendar_prefix,
+                "duration_minutes": cfg.calendar_default_duration,
+            }
+        )
+
+    # ── Measurement Settings ──
+
+    @mcp.tool()
+    async def get_measurement_settings() -> str:
+        """Get the configured measurement unit settings.
+
+        Returns current unit settings for weight, height, glucose, food,
+        and water along with all available options for each.
+
+        Configure via environment variables:
+            KAHUNAS_WEIGHT_UNIT: kg or lbs (default: kg)
+            KAHUNAS_HEIGHT_UNIT: cm or inches (default: cm)
+            KAHUNAS_GLUCOSE_UNIT: mmol_l or mg_dl (default: mmol_l)
+            KAHUNAS_FOOD_UNIT: grams, ounces, qty, cups, oz, ml, tsp (default: grams)
+            KAHUNAS_WATER_UNIT: ml, l, or oz (default: ml)
+        """
+        cfg = config or KahunasConfig.from_env()
+        current = {
+            "weight": cfg.weight_unit,
+            "height": cfg.height_unit,
+            "glucose": cfg.glucose_unit,
+            "food": cfg.food_unit,
+            "water": cfg.water_unit,
+        }
+        return _compact(
+            {
+                "current": current,
+                "available": MEASUREMENT_SETTINGS,
+                "metrics": get_metrics_with_units(cfg.weight_unit, cfg.height_unit),
+            }
+        )
+
+    # ── Client Removal ──
+
+    @mcp.tool()
+    async def remove_client(
+        client_uuid: str,
+        remove_from_kahunas: bool = True,
+        remove_calendar_appointments: bool = True,
+    ) -> str:
+        """Remove a client from Kahunas and/or their calendar appointments.
+
+        This tool can:
+        1. Delete the client from Kahunas (remove_from_kahunas=True)
+        2. Find and list their calendar appointments for removal
+           (remove_calendar_appointments=True)
+
+        Calendar events are identified by Kahunas UUID. For Google Calendar,
+        use the returned appointment UUIDs with your calendar's delete API.
+        For Apple Calendar, re-export the .ics without the removed client.
+
+        WARNING: Removing a client from Kahunas is permanent.
+        """
+        from ..calendar_sync import build_removal_summary
+
+        results: dict[str, Any] = {"client_uuid": client_uuid}
+        appointments_found = 0
+        kahunas_removed = False
+
+        # Find calendar appointments for this client
+        if remove_calendar_appointments:
+            try:
+                resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
+                data = resp.json()
+                events = []
+                if isinstance(data, list):
+                    events = data
+                elif isinstance(data, dict):
+                    events = data.get("data", data.get("events", []))
+
+                client_events = []
+                for evt in events:
+                    if evt.get("client_uuid", evt.get("client_id", "")) == client_uuid:
+                        client_events.append(
+                            {
+                                "uuid": evt.get("id", evt.get("uuid", "")),
+                                "title": evt.get("title", ""),
+                                "start": evt.get("start", ""),
+                            }
+                        )
+                appointments_found = len(client_events)
+                results["calendar_appointments"] = client_events
+            except Exception as exc:
+                results["calendar_error"] = str(exc)
+
+        # Remove from Kahunas
+        if remove_from_kahunas:
+            try:
+                resp = await _get_client().get_client_action("delete", client_uuid)
+                kahunas_removed = resp.status_code < 400
+                results["kahunas_response"] = resp.text[:200]
+            except Exception as exc:
+                results["kahunas_error"] = str(exc)
+
+        summary = build_removal_summary(
+            client_name=results.get("client_name", client_uuid),
+            client_uuid=client_uuid,
+            appointments_found=appointments_found,
+            appointments_removed=0,  # Actual removal done by external calendar API
+            kahunas_removed=kahunas_removed,
+        )
+        results["summary"] = summary
+        return _compact(results)
+
+    # ── Exercise & Diet Discovery ──
+
+    @mcp.tool()
+    async def discover_all_exercises(max_pages: int = 20) -> str:
+        """Discover and list ALL exercises in the Kahunas exercise library.
+
+        Paginates through the entire exercise library to return every
+        exercise name, UUID, and type. Useful for building a complete
+        exercise catalogue or checking which exercises are available.
+
+        Returns all exercises sorted alphabetically by name.
+        """
+        all_exercises: list[dict[str, Any]] = []
+        page = 1
+        per_page = 50
+
+        while page <= max_pages:
+            data = await _get_client().list_exercises(page, per_page)
+            for ex in data.exercises:
+                all_exercises.append(
+                    {
+                        "name": ex.exercise_name or ex.title,
+                        "uuid": ex.uuid,
+                        "type": "strength" if ex.exercise_type == 1 else "cardio",
+                        "tags": ex.tags or None,
+                    }
+                )
+            if len(data.exercises) < per_page:
+                break
+            page += 1
+
+        # Sort alphabetically
+        all_exercises.sort(key=lambda x: (x.get("name") or "").lower())
+
+        return _compact(
+            {
+                "exercises": all_exercises,
+                "total": len(all_exercises),
+                "types": {
+                    "strength": sum(1 for e in all_exercises if e["type"] == "strength"),
+                    "cardio": sum(1 for e in all_exercises if e["type"] == "cardio"),
+                },
+            }
+        )
+
+    @mcp.tool()
+    async def discover_diet_plans() -> str:
+        """Discover all diet plans available in Kahunas.
+
+        Lists all diet plans with their details. Useful for checking
+        what nutrition plans are configured for clients.
+        """
+        resp = await _get_client().diet_plan_action("list")
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch diet plans", "raw": resp.text[:200]})
+        return _compact(data)
+
+    @mcp.tool()
+    async def discover_supplement_plans() -> str:
+        """Discover all supplement plans available in Kahunas.
+
+        Lists all supplement plans with their details.
+        """
+        resp = await _get_client().supplement_plan_action("list")
+        try:
+            data = resp.json()
+        except Exception:
+            return _compact({"error": "Could not fetch supplement plans", "raw": resp.text[:200]})
+        return _compact(data)
+
+    # ── Metrics Store (Local Timeseries) ──
+
+    @mcp.tool()
+    async def store_client_metrics(
+        client_uuid: str,
+        metric: str,
+        data_points: str,
+        client_name: str = "",
+    ) -> str:
+        """Store client metric data points in the local timeseries database.
+
+        Saves progress data locally so charts can be generated from cache.
+        Data is stored in ~/.kahunas/metrics.db (SQLite).
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+
+        data_points should be a JSON string of [{date, value}, ...].
+        Example: '[{"date":"2024-01-15","value":85.0},{"date":"2024-02-15","value":83.5}]'
+        """
+        store = _get_metrics()
+        try:
+            points = json.loads(data_points)
+        except json.JSONDecodeError:
+            return _compact({"error": "Invalid JSON in data_points"})
+
+        if not isinstance(points, list):
+            return _compact({"error": "data_points must be a JSON array"})
+
+        try:
+            inserted = store.record_batch(
+                client_uuid=client_uuid,
+                metric=metric,
+                data_points=points,
+                client_name=client_name,
+            )
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        return _compact(
+            {
+                "status": "stored",
+                "client_uuid": client_uuid,
+                "metric": metric,
+                "inserted": inserted,
+                "total_points": len(points),
+            }
+        )
+
+    @mcp.tool()
+    async def query_client_metrics(
+        client_uuid: str,
+        metric: str,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> str:
+        """Query stored metric data from the local timeseries database.
+
+        Returns data points for the specified client and metric, optionally
+        filtered by date range. Data is sorted chronologically.
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+        """
+        store = _get_metrics()
+        points = store.query(
+            client_uuid=client_uuid,
+            metric=metric,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        summary = store.get_summary(client_uuid, metric)
+        meta = METRIC_DEFINITIONS.get(metric, {})
+
+        return _compact(
+            {
+                "data": points,
+                "count": len(points),
+                "metric": metric,
+                "label": meta.get("label", metric),
+                "unit": meta.get("unit", ""),
+                "summary": summary,
+            }
+        )
+
+    @mcp.tool()
+    async def list_stored_clients() -> str:
+        """List all clients with locally stored metric data.
+
+        Shows which clients have cached progress data and what metrics
+        are available for each.
+        """
+        store = _get_metrics()
+        clients = store.list_clients()
+        return _compact({"clients": clients, "count": len(clients)})
+
+    @mcp.tool()
+    async def sync_client_metrics(
+        client_uuid: str,
+        metric: str = "weight",
+        time_range: str = "all",
+        client_name: str = "",
+    ) -> str:
+        """Fetch client metrics from Kahunas API and store locally.
+
+        Fetches progress data from the Kahunas API and saves it to the
+        local timeseries database for offline chart generation.
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+        Time ranges: week, month, quarter, year, all.
+        """
+        # Fetch from API
+        resp = await _get_client().get_chart_data(client_uuid, value=metric, range_type=time_range)
+
+        data_points: list[dict[str, Any]] = []
+        try:
+            raw = resp.json()
+            if isinstance(raw, list):
+                data_points = raw
+            elif isinstance(raw, dict):
+                data_points = raw.get("data", raw.get("chart_data", []))
+                if isinstance(data_points, dict):
+                    data_points = []
+        except Exception:
+            return _compact({"error": "Could not parse API response"})
+
+        # Store locally
+        store = _get_metrics()
+        try:
+            inserted = store.record_batch(
+                client_uuid=client_uuid,
+                metric=metric,
+                data_points=data_points,
+                client_name=client_name,
+            )
+        except ValueError as exc:
+            return _compact({"error": str(exc)})
+
+        return _compact(
+            {
+                "status": "synced",
+                "metric": metric,
+                "fetched": len(data_points),
+                "new_records": inserted,
+                "client_uuid": client_uuid,
+            }
+        )
+
+    @mcp.tool()
+    async def generate_chart_from_store(
+        client_uuid: str,
+        metric: str = "weight",
+        time_range: str = "all",
+        client_name: str = "",
+        output_path: str = "",
+    ) -> str:
+        """Generate a PNG chart from locally stored metric data.
+
+        Uses data from the local timeseries database (no API call needed).
+        Call sync_client_metrics first to ensure data is up to date.
+
+        Metrics: weight, bodyfat, steps, chest, waist, hips, arms, thighs.
+        Time ranges: week, month, quarter, year, all.
+        """
+        from ..charts import generate_chart
+
+        store = _get_metrics()
+        points = store.query(client_uuid, metric)
+
+        # Convert to chart format
+        chart_data = [{"date": p["date"], "value": p["value"]} for p in points]
+
+        if not output_path:
+            safe_name = client_name.replace(" ", "_") or client_uuid[:8]
+            output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
+
+        png_bytes = generate_chart(
+            data_points=chart_data,
+            metric=metric,
+            time_range=time_range,
+            client_name=client_name,
+            output_path=output_path,
+        )
+
+        b64 = base64.b64encode(png_bytes).decode("ascii")
+        return _compact(
+            {
+                "path": output_path,
+                "metric": metric,
+                "range": time_range,
+                "points": len(chart_data),
+                "size_kb": round(len(png_bytes) / 1024, 1),
+                "image_base64": b64[:100] + "..." if len(b64) > 100 else b64,
             }
         )
 

@@ -33,6 +33,39 @@ class KahunasConfig(BaseSettings):
         default="44", description="Default country code for phone normalisation (44 = UK)"
     )
 
+    # Calendar sync settings
+    calendar_prefix: str = Field(
+        default="Workout", description="Prefix for calendar event titles (e.g. 'Workout', 'PT')"
+    )
+    default_gym: str = Field(
+        default="", description="Default gym/location for calendar appointments"
+    )
+    gym_list: str = Field(
+        default="",
+        description="Comma-separated list of available gyms (e.g. 'Gym A,Gym B,Home')",
+    )
+    calendar_default_duration: int = Field(
+        default=60, description="Default appointment duration in minutes"
+    )
+
+    # Measurement unit settings (match Kahunas coach/configuration page)
+    weight_unit: str = Field(default="kg", description="Weight unit: 'kg' or 'lbs'")
+    height_unit: str = Field(default="cm", description="Height unit: 'cm' or 'inches'")
+    glucose_unit: str = Field(
+        default="mmol_l", description="Glucose level unit: 'mmol_l' or 'mg_dl'"
+    )
+    food_unit: str = Field(
+        default="grams",
+        description="Food unit: 'grams', 'ounces', 'qty', 'cups', 'oz', 'ml', 'tsp'",
+    )
+    water_unit: str = Field(default="ml", description="Water unit: 'ml', 'l', or 'oz'")
+
+    # Timezone setting (from Kahunas coach/configuration page)
+    timezone: str = Field(
+        default="Europe/London",
+        description="Timezone for appointments and scheduling (IANA format, e.g. 'Europe/London')",
+    )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> KahunasConfig:
         """Load config from a YAML file, merged with env vars."""
