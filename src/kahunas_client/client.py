@@ -195,7 +195,7 @@ class KahunasClient:
 
         # Guard against non-JSON responses (HTML error pages, redirects)
         content_type = resp.headers.get("content-type", "")
-        if "application/json" not in content_type and resp.status_code != 200:
+        if "application/json" not in content_type:
             raise KahunasError(
                 f"Unexpected response (status={resp.status_code}, "
                 f"type={content_type[:50]}): {resp.text[:200]}"
