@@ -687,6 +687,7 @@ src/kahunas_client/
 ├── metrics_store.py      # Local SQLite timeseries database for progress data
 ├── pdf_export.py         # PDF generation (fpdf2) for programs, plans, summaries
 ├── persona.py            # Messaging persona/template system
+├── data_sync.py          # Incremental SQLite sync (clients, check-ins, progress, habits, chat)
 ├── phone_alignment.py    # Phone number alignment (Kahunas vs WhatsApp E.164)
 ├── whatsapp.py           # WhatsApp Business API client
 ├── models/               # Pydantic v2 models
@@ -696,7 +697,7 @@ src/kahunas_client/
 │   ├── exercises.py      # Exercise, ExerciseListData
 │   └── workouts.py       # WorkoutProgram, WorkoutDay, ExerciseSet
 ├── mcp/                  # MCP server (FastMCP 3.x, stdio + HTTP/SSE)
-│   ├── server.py         # 68 tool definitions (compact JSON, contextvars isolation)
+│   ├── server.py         # 75 tool definitions (compact JSON, contextvars isolation)
 │   ├── export.py         # Excel export manager (async I/O)
 │   ├── lambda_handler.py # AWS Lambda handler (Mangum)
 │   └── __main__.py       # Entry point (stdio, http, sse, streamable-http)
@@ -710,7 +711,7 @@ src/kahunas_client/
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests (659 tests)
+# Run tests
 pytest tests/ -v
 
 # Run linter

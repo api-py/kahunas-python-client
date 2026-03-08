@@ -150,7 +150,11 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         """Authenticate with Kahunas. Call this first before using other tools."""
         cfg = config or KahunasConfig.from_env()
         client = KahunasClient(cfg)
-        await client.__aenter__()
+        try:
+            await client.__aenter__()
+        except Exception:
+            await client.__aexit__(None, None, None)
+            raise
         _client_var.set(client)
         _export_var.set(ExportManager(client))
         return _compact(
@@ -613,20 +617,21 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         Phone can be in any format — it will be normalised automatically.
         Examples: "+447700900123", "07700 900123", "447700900123".
 
-        Requires WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID env vars.
+        Requires KAHUNAS_WHATSAPP_TOKEN and KAHUNAS_WHATSAPP_PHONE_NUMBER_ID env vars.
         """
         from ..whatsapp import WhatsAppClient, WhatsAppConfig, normalise_phone
 
+        cfg = _get_client()._config
         wa_config = WhatsAppConfig(
-            access_token=os.environ.get("WHATSAPP_TOKEN", ""),
-            phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
-            default_country_code=os.environ.get("WHATSAPP_DEFAULT_COUNTRY_CODE", "44"),
+            access_token=cfg.whatsapp_token,
+            phone_number_id=cfg.whatsapp_phone_number_id,
+            default_country_code=cfg.whatsapp_default_country_code,
         )
         if not wa_config.is_configured():
             return _compact(
                 {
                     "error": "WhatsApp not configured. "
-                    "Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID."
+                    "Set KAHUNAS_WHATSAPP_TOKEN and KAHUNAS_WHATSAPP_PHONE_NUMBER_ID."
                 }
             )
 
@@ -650,10 +655,11 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         """
         from ..whatsapp import WhatsAppClient, WhatsAppConfig, normalise_phone
 
+        cfg = _get_client()._config
         wa_config = WhatsAppConfig(
-            access_token=os.environ.get("WHATSAPP_TOKEN", ""),
-            phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
-            default_country_code=os.environ.get("WHATSAPP_DEFAULT_COUNTRY_CODE", "44"),
+            access_token=cfg.whatsapp_token,
+            phone_number_id=cfg.whatsapp_phone_number_id,
+            default_country_code=cfg.whatsapp_default_country_code,
         )
         if not wa_config.is_configured():
             return _compact({"error": "WhatsApp not configured."})
@@ -1595,8 +1601,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def api_request(method: str, path: str, params: str = "", body: str = "") -> str:
         """Make a raw API request. Params and body should be JSON strings."""
         client = _get_client()
-        parsed_params = json.loads(params) if params else None
-        parsed_body = json.loads(body) if body else None
+        try:
+            parsed_params = json.loads(params) if params else None
+        except json.JSONDecodeError:
+            return _compact({"error": "Invalid JSON in params"})
+        try:
+            parsed_body = json.loads(body) if body else None
+        except json.JSONDecodeError:
+            return _compact({"error": "Invalid JSON in body"})
         if method.upper() == "GET":
             result = await client.api_get(path, params=parsed_params)
         else:
@@ -1732,8 +1744,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": "Could not fetch check-in data"})
 
+        checkins_list = raw_data
+        if isinstance(raw_data, dict):
+            checkins_list = raw_data.get(
+                "checkins", raw_data.get("check_ins", raw_data.get("data", []))
+            )
         summary = format_checkin_summary(
-            raw_data,
+            checkins_list,
             client_name=client_name,
             weight_unit=config.weight_unit,
             measurement_unit=config.height_unit,
@@ -1936,8 +1953,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": "Could not fetch check-in data"})
 
+        checkins_list = raw_data
+        if isinstance(raw_data, dict):
+            checkins_list = raw_data.get(
+                "checkins", raw_data.get("check_ins", raw_data.get("data", []))
+            )
         summary = format_checkin_summary(
-            raw_data,
+            checkins_list,
             client_name=client_name,
             weight_unit=config.weight_unit,
             measurement_unit=config.height_unit,
@@ -2152,9 +2174,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         or KAHUNAS_SYNC_DB env var).
         """
         client = _get_client()
-        sync = _get_sync() if not db_path else SyncStore(db_path)
         if db_path:
+            old_sync = _sync_var.get()
+            if old_sync is not None:
+                old_sync.close()
+            sync = SyncStore(db_path)
             _sync_var.set(sync)
+        else:
+            sync = _get_sync()
 
         results: dict[str, Any] = {}
 
@@ -2297,9 +2324,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         one client. Faster than sync_all_data when you only need one client.
         """
         client = _get_client()
-        sync = _get_sync() if not db_path else SyncStore(db_path)
         if db_path:
+            old_sync = _sync_var.get()
+            if old_sync is not None:
+                old_sync.close()
+            sync = SyncStore(db_path)
             _sync_var.set(sync)
+        else:
+            sync = _get_sync()
 
         results: dict[str, Any] = {"client_uuid": client_uuid}
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -236,11 +237,18 @@ class SyncStore:
         resolved = db_path or os.getenv("KAHUNAS_SYNC_DB", _DEFAULT_DB_PATH)
         self._db_path = Path(resolved).expanduser()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path))
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+
+    def __enter__(self) -> SyncStore:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
 
     def _init_schema(self) -> None:
         for statement in _SCHEMA_SQL.split(";"):
@@ -250,7 +258,8 @@ class SyncStore:
         self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ── Sync state ──────────────────────────────────────────────────────
 
@@ -268,17 +277,18 @@ class SyncStore:
         record_count: int = 0,
         last_id: str = "",
     ) -> None:
-        self._conn.execute(
-            """INSERT INTO sync_state
-               (client_uuid, data_type, last_synced_at, last_id, record_count)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(client_uuid, data_type)
-               DO UPDATE SET last_synced_at=excluded.last_synced_at,
-                             last_id=excluded.last_id,
-                             record_count=excluded.record_count""",
-            (client_uuid, data_type, _now(), last_id, record_count),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO sync_state
+                   (client_uuid, data_type, last_synced_at, last_id, record_count)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(client_uuid, data_type)
+                   DO UPDATE SET last_synced_at=excluded.last_synced_at,
+                                 last_id=excluded.last_id,
+                                 record_count=excluded.record_count""",
+                (client_uuid, data_type, _now(), last_id, record_count),
+            )
+            self._conn.commit()
 
     # ── Clients ─────────────────────────────────────────────────────────
 
@@ -286,33 +296,58 @@ class SyncStore:
         uuid = client.get("uuid", client.get("id", ""))
         if not uuid:
             return False
-        self._conn.execute(
-            """INSERT INTO clients
-               (uuid, first_name, last_name, email, phone, status, raw_json, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uuid)
-               DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name,
-                             email=excluded.email, phone=excluded.phone, status=excluded.status,
-                             raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
-            (
-                str(uuid),
-                client.get("first_name", ""),
-                client.get("last_name", ""),
-                client.get("email", ""),
-                client.get("phone", ""),
-                client.get("status", ""),
-                _safe_json(client),
-                _now(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO clients
+                   (uuid, first_name, last_name, email, phone, status, raw_json, synced_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(uuid)
+                   DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name,
+                                 email=excluded.email, phone=excluded.phone, status=excluded.status,
+                                 raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
+                (
+                    str(uuid),
+                    client.get("first_name", ""),
+                    client.get("last_name", ""),
+                    client.get("email", ""),
+                    client.get("phone", ""),
+                    client.get("status", ""),
+                    _safe_json(client),
+                    _now(),
+                ),
+            )
+            self._conn.commit()
         return True
 
     def upsert_clients(self, clients: list[dict[str, Any]]) -> int:
         count = 0
-        for c in clients:
-            if self.upsert_client(c):
+        with self._lock:
+            for c in clients:
+                uuid = c.get("uuid", c.get("id", ""))
+                if not uuid:
+                    continue
+                self._conn.execute(
+                    """INSERT INTO clients
+                       (uuid, first_name, last_name, email, phone, status, raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uuid)
+                       DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name,
+                                     email=excluded.email, phone=excluded.phone,
+                                     status=excluded.status, raw_json=excluded.raw_json,
+                                     synced_at=excluded.synced_at""",
+                    (
+                        str(uuid),
+                        c.get("first_name", ""),
+                        c.get("last_name", ""),
+                        c.get("email", ""),
+                        c.get("phone", ""),
+                        c.get("status", ""),
+                        _safe_json(c),
+                        _now(),
+                    ),
+                )
                 count += 1
+            self._conn.commit()
         return count
 
     def list_clients(self) -> list[dict[str, Any]]:
@@ -323,8 +358,10 @@ class SyncStore:
 
     # ── Check-ins ───────────────────────────────────────────────────────
 
-    def upsert_checkin(self, client_uuid: str, checkin: dict[str, Any]) -> tuple[bool, int]:
-        """Upsert a check-in and its photos. Returns (inserted, photo_count)."""
+    def _upsert_checkin_no_commit(
+        self, client_uuid: str, checkin: dict[str, Any]
+    ) -> tuple[bool, int]:
+        """Upsert a single check-in without committing (caller manages tx)."""
         uuid = checkin.get("uuid", "")
         if not uuid:
             return False, 0
@@ -372,7 +409,6 @@ class SyncStore:
             ),
         )
 
-        # Upsert photos
         photo_count = 0
         for url in _extract_photos(checkin):
             self._conn.execute(
@@ -384,17 +420,25 @@ class SyncStore:
             )
             photo_count += 1
 
-        self._conn.commit()
         return True, photo_count
+
+    def upsert_checkin(self, client_uuid: str, checkin: dict[str, Any]) -> tuple[bool, int]:
+        """Upsert a check-in and its photos. Returns (inserted, photo_count)."""
+        with self._lock:
+            result = self._upsert_checkin_no_commit(client_uuid, checkin)
+            self._conn.commit()
+        return result
 
     def upsert_checkins(self, client_uuid: str, checkins: list[dict[str, Any]]) -> dict[str, int]:
         inserted = 0
         photos = 0
-        for ci in checkins:
-            ok, pc = self.upsert_checkin(client_uuid, ci)
-            if ok:
-                inserted += 1
-            photos += pc
+        with self._lock:
+            for ci in checkins:
+                ok, pc = self._upsert_checkin_no_commit(client_uuid, ci)
+                if ok:
+                    inserted += 1
+                photos += pc
+            self._conn.commit()
         return {"checkins": inserted, "photos": photos}
 
     def get_client_checkin_count(self, client_uuid: str) -> int:
@@ -421,24 +465,25 @@ class SyncStore:
     ) -> int:
         now = _now()
         inserted = 0
-        for pt in data_points:
-            date_str = pt.get("date", pt.get("label", ""))
-            val = _to_float(pt.get("value", pt.get("y")))
-            if not date_str or val is None:
-                continue
-            try:
-                self._conn.execute(
-                    """INSERT INTO progress_metrics
-                       (client_uuid, metric, value, recorded_at, synced_at)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(client_uuid, metric, recorded_at)
-                       DO UPDATE SET value=excluded.value, synced_at=excluded.synced_at""",
-                    (client_uuid, metric, val, date_str, now),
-                )
-                inserted += 1
-            except sqlite3.IntegrityError:
-                pass
-        self._conn.commit()
+        with self._lock:
+            for pt in data_points:
+                date_str = pt.get("date", pt.get("label", ""))
+                val = _to_float(pt.get("value", pt.get("y")))
+                if not date_str or val is None:
+                    continue
+                try:
+                    self._conn.execute(
+                        """INSERT INTO progress_metrics
+                           (client_uuid, metric, value, recorded_at, synced_at)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(client_uuid, metric, recorded_at)
+                           DO UPDATE SET value=excluded.value, synced_at=excluded.synced_at""",
+                        (client_uuid, metric, val, date_str, now),
+                    )
+                    inserted += 1
+                except sqlite3.IntegrityError:
+                    pass
+            self._conn.commit()
         return inserted
 
     def get_progress_count(self, client_uuid: str, metric: str) -> int:
@@ -453,29 +498,30 @@ class SyncStore:
     def upsert_habits(self, client_uuid: str, habits: list[dict[str, Any]]) -> int:
         now = _now()
         inserted = 0
-        for h in habits:
-            uuid = h.get("uuid", "")
-            if not uuid:
-                continue
-            self._conn.execute(
-                """INSERT INTO habits
-                   (uuid, client_uuid, title, date, completed, raw_json, synced_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(uuid, date) DO UPDATE SET
-                   completed=excluded.completed, raw_json=excluded.raw_json,
-                   synced_at=excluded.synced_at""",
-                (
-                    uuid,
-                    client_uuid,
-                    h.get("title", ""),
-                    h.get("date", ""),
-                    1 if h.get("completed") else 0,
-                    _safe_json(h),
-                    now,
-                ),
-            )
-            inserted += 1
-        self._conn.commit()
+        with self._lock:
+            for h in habits:
+                uuid = h.get("uuid", "")
+                if not uuid:
+                    continue
+                self._conn.execute(
+                    """INSERT INTO habits
+                       (uuid, client_uuid, title, date, completed, raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uuid, date) DO UPDATE SET
+                       completed=excluded.completed, raw_json=excluded.raw_json,
+                       synced_at=excluded.synced_at""",
+                    (
+                        uuid,
+                        client_uuid,
+                        h.get("title", ""),
+                        h.get("date", ""),
+                        1 if h.get("completed") else 0,
+                        _safe_json(h),
+                        now,
+                    ),
+                )
+                inserted += 1
+            self._conn.commit()
         return inserted
 
     # ── Chat messages ───────────────────────────────────────────────────
@@ -483,30 +529,32 @@ class SyncStore:
     def upsert_chat_messages(self, client_uuid: str, messages: list[dict[str, Any]]) -> int:
         now = _now()
         inserted = 0
-        for msg in messages:
-            msg_id = msg.get("id", 0)
-            if not msg_id:
-                continue
-            self._conn.execute(
-                """INSERT INTO chat_messages
-                   (id, client_uuid, sender_uuid, message, created_at, is_read, raw_json, synced_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                   is_read=excluded.is_read, raw_json=excluded.raw_json,
-                   synced_at=excluded.synced_at""",
-                (
-                    int(msg_id),
-                    client_uuid,
-                    msg.get("sender_uuid", msg.get("sender_name", "")),
-                    msg.get("message", ""),
-                    msg.get("created_at", ""),
-                    1 if msg.get("read") else 0,
-                    _safe_json(msg),
-                    now,
-                ),
-            )
-            inserted += 1
-        self._conn.commit()
+        with self._lock:
+            for msg in messages:
+                msg_id = msg.get("id", 0)
+                if not msg_id:
+                    continue
+                self._conn.execute(
+                    """INSERT INTO chat_messages
+                       (id, client_uuid, sender_uuid, message, created_at, is_read,
+                        raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                       is_read=excluded.is_read, raw_json=excluded.raw_json,
+                       synced_at=excluded.synced_at""",
+                    (
+                        int(msg_id),
+                        client_uuid,
+                        msg.get("sender_uuid", msg.get("sender_name", "")),
+                        msg.get("message", ""),
+                        msg.get("created_at", ""),
+                        1 if msg.get("read") else 0,
+                        _safe_json(msg),
+                        now,
+                    ),
+                )
+                inserted += 1
+            self._conn.commit()
         return inserted
 
     def get_last_chat_id(self, client_uuid: str) -> int:
@@ -523,38 +571,67 @@ class SyncStore:
         if not uuid:
             return False
         tags = program.get("tags", [])
-        self._conn.execute(
-            """INSERT INTO workout_programs
-               (uuid, title, short_desc, long_desc, days, tags, updated_at, raw_json, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uuid) DO UPDATE SET
-               title=excluded.title, short_desc=excluded.short_desc,
-               long_desc=excluded.long_desc, days=excluded.days,
-               tags=excluded.tags, updated_at=excluded.updated_at,
-               raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
-            (
-                uuid,
-                program.get("title", ""),
-                program.get("short_desc", ""),
-                program.get("long_desc", ""),
-                program.get("days", len(program.get("workout_days", []))),
-                _safe_json(tags if isinstance(tags, list) else []),
-                program.get("updated_at", ""),
-                _safe_json(program),
-                _now(),
-            ),
-        )
-        # Extract media attachments
-        for att in _extract_attachments(program):
-            self._upsert_attachment(uuid, "workout_program", att)
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO workout_programs
+                   (uuid, title, short_desc, long_desc, days, tags, updated_at, raw_json, synced_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(uuid) DO UPDATE SET
+                   title=excluded.title, short_desc=excluded.short_desc,
+                   long_desc=excluded.long_desc, days=excluded.days,
+                   tags=excluded.tags, updated_at=excluded.updated_at,
+                   raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
+                (
+                    uuid,
+                    program.get("title", ""),
+                    program.get("short_desc", ""),
+                    program.get("long_desc", ""),
+                    program.get("days", len(program.get("workout_days", []))),
+                    _safe_json(tags if isinstance(tags, list) else []),
+                    program.get("updated_at", ""),
+                    _safe_json(program),
+                    _now(),
+                ),
+            )
+            for att in _extract_attachments(program):
+                self._upsert_attachment(uuid, "workout_program", att)
+            self._conn.commit()
         return True
 
     def upsert_workout_programs(self, programs: list[dict[str, Any]]) -> int:
         count = 0
-        for p in programs:
-            if self.upsert_workout_program(p):
+        with self._lock:
+            for p in programs:
+                uuid = p.get("uuid", "")
+                if not uuid:
+                    continue
+                tags = p.get("tags", [])
+                self._conn.execute(
+                    """INSERT INTO workout_programs
+                       (uuid, title, short_desc, long_desc, days, tags,
+                        updated_at, raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uuid) DO UPDATE SET
+                       title=excluded.title, short_desc=excluded.short_desc,
+                       long_desc=excluded.long_desc, days=excluded.days,
+                       tags=excluded.tags, updated_at=excluded.updated_at,
+                       raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
+                    (
+                        uuid,
+                        p.get("title", ""),
+                        p.get("short_desc", ""),
+                        p.get("long_desc", ""),
+                        p.get("days", len(p.get("workout_days", []))),
+                        _safe_json(tags if isinstance(tags, list) else []),
+                        p.get("updated_at", ""),
+                        _safe_json(p),
+                        _now(),
+                    ),
+                )
+                for att in _extract_attachments(p):
+                    self._upsert_attachment(uuid, "workout_program", att)
                 count += 1
+            self._conn.commit()
         return count
 
     # ── Exercises ───────────────────────────────────────────────────────
@@ -564,37 +641,68 @@ class SyncStore:
         if not uuid:
             return False
         tags = exercise.get("tags", [])
-        self._conn.execute(
-            """INSERT INTO exercises
-               (uuid, exercise_name, title, exercise_type, sets, reps, tags, raw_json, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(uuid) DO UPDATE SET
-               exercise_name=excluded.exercise_name, title=excluded.title,
-               exercise_type=excluded.exercise_type, sets=excluded.sets,
-               reps=excluded.reps, tags=excluded.tags,
-               raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
-            (
-                uuid,
-                exercise.get("exercise_name", ""),
-                exercise.get("title", ""),
-                exercise.get("exercise_type", 0),
-                str(exercise.get("sets", "")),
-                str(exercise.get("reps", "")),
-                _safe_json(tags if isinstance(tags, list) else []),
-                _safe_json(exercise),
-                _now(),
-            ),
-        )
-        for att in _extract_attachments(exercise):
-            self._upsert_attachment(uuid, "exercise", att)
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO exercises
+                   (uuid, exercise_name, title, exercise_type, sets, reps,
+                    tags, raw_json, synced_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(uuid) DO UPDATE SET
+                   exercise_name=excluded.exercise_name, title=excluded.title,
+                   exercise_type=excluded.exercise_type, sets=excluded.sets,
+                   reps=excluded.reps, tags=excluded.tags,
+                   raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
+                (
+                    uuid,
+                    exercise.get("exercise_name", ""),
+                    exercise.get("title", ""),
+                    exercise.get("exercise_type", 0),
+                    str(exercise.get("sets", "")),
+                    str(exercise.get("reps", "")),
+                    _safe_json(tags if isinstance(tags, list) else []),
+                    _safe_json(exercise),
+                    _now(),
+                ),
+            )
+            for att in _extract_attachments(exercise):
+                self._upsert_attachment(uuid, "exercise", att)
+            self._conn.commit()
         return True
 
     def upsert_exercises(self, exercises: list[dict[str, Any]]) -> int:
         count = 0
-        for e in exercises:
-            if self.upsert_exercise(e):
+        with self._lock:
+            for e in exercises:
+                uuid = e.get("uuid", "")
+                if not uuid:
+                    continue
+                tags = e.get("tags", [])
+                self._conn.execute(
+                    """INSERT INTO exercises
+                       (uuid, exercise_name, title, exercise_type, sets, reps,
+                        tags, raw_json, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uuid) DO UPDATE SET
+                       exercise_name=excluded.exercise_name, title=excluded.title,
+                       exercise_type=excluded.exercise_type, sets=excluded.sets,
+                       reps=excluded.reps, tags=excluded.tags,
+                       raw_json=excluded.raw_json, synced_at=excluded.synced_at""",
+                    (
+                        uuid,
+                        e.get("exercise_name", ""),
+                        e.get("title", ""),
+                        e.get("exercise_type", 0),
+                        str(e.get("sets", "")),
+                        str(e.get("reps", "")),
+                        _safe_json(tags if isinstance(tags, list) else []),
+                        _safe_json(e),
+                        _now(),
+                    ),
+                )
+                for att in _extract_attachments(e):
+                    self._upsert_attachment(uuid, "exercise", att)
                 count += 1
+            self._conn.commit()
         return count
 
     # ── Attachments ─────────────────────────────────────────────────────
@@ -615,20 +723,22 @@ class SyncStore:
         )
 
     def mark_attachment_downloaded(self, parent_uuid: str, file_url: str, local_path: str) -> None:
-        self._conn.execute(
-            """UPDATE attachments SET downloaded=1, local_path=?
-               WHERE parent_uuid=? AND file_url=?""",
-            (local_path, parent_uuid, file_url),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE attachments SET downloaded=1, local_path=?
+                   WHERE parent_uuid=? AND file_url=?""",
+                (local_path, parent_uuid, file_url),
+            )
+            self._conn.commit()
 
     def mark_photo_downloaded(self, checkin_uuid: str, photo_url: str, local_path: str) -> None:
-        self._conn.execute(
-            """UPDATE checkin_photos SET downloaded=1, local_path=?
-               WHERE checkin_uuid=? AND photo_url=?""",
-            (local_path, checkin_uuid, photo_url),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """UPDATE checkin_photos SET downloaded=1, local_path=?
+                   WHERE checkin_uuid=? AND photo_url=?""",
+                (local_path, checkin_uuid, photo_url),
+            )
+            self._conn.commit()
 
     def get_pending_photos(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self._conn.execute(
@@ -648,10 +758,26 @@ class SyncStore:
 
     # ── Summary / stats ─────────────────────────────────────────────────
 
+    _ALLOWED_TABLES = frozenset(
+        {
+            "clients",
+            "checkins",
+            "checkin_photos",
+            "progress_metrics",
+            "habits",
+            "chat_messages",
+            "workout_programs",
+            "exercises",
+            "attachments",
+        }
+    )
+
     def get_sync_summary(self) -> dict[str, Any]:
         """Return counts of all synced data."""
 
         def _count(table: str) -> int:
+            if table not in self._ALLOWED_TABLES:
+                raise ValueError(f"Invalid table name: {table}")
             row = self._conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
             return row["c"] if row else 0
 

@@ -18,14 +18,18 @@ class KahunasConfig(BaseSettings):
     api_base_url: str = Field(default="https://api.kahunas.io/api", description="API base URL")
     web_base_url: str = Field(default="https://kahunas.io", description="Web app base URL")
     email: str = Field(default="", description="Account email for authentication")
-    password: str = Field(default="", description="Account password for authentication")
-    auth_token: str = Field(default="", description="Pre-existing auth token (skips login)")
+    password: str = Field(default="", repr=False, description="Account password for authentication")
+    auth_token: str = Field(
+        default="", repr=False, description="Pre-existing auth token (skips login)"
+    )
     timeout: float = Field(default=30.0, description="HTTP request timeout in seconds")
     max_retries: int = Field(default=3, description="Max retry attempts for failed requests")
     retry_base_delay: float = Field(default=1.0, description="Base delay between retries (seconds)")
 
     # WhatsApp Business API settings
-    whatsapp_token: str = Field(default="", description="WhatsApp Cloud API access token")
+    whatsapp_token: str = Field(
+        default="", repr=False, description="WhatsApp Cloud API access token"
+    )
     whatsapp_phone_number_id: str = Field(
         default="", description="WhatsApp Business phone number ID"
     )
