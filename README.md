@@ -1,5 +1,9 @@
 # Kahunas Python Client
 
+[![CI](https://github.com/api-py/kahunas-python-client/actions/workflows/ci.yml/badge.svg)](https://github.com/api-py/kahunas-python-client/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io) fitness coaching platform.
 
 ## Features
@@ -19,9 +23,10 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 - **Phone Alignment** — Compare and fix phone numbers between Kahunas client data and WhatsApp E.164 format
 - **Messaging Persona** — Configurable persona template for client communications (default: London-based PT, 15 years experience, British English) — see [`persona.example.txt`](persona.example.txt)
 - **Incremental Data Sync** — Mirror all Kahunas data to a local SQLite database with delta-only synchronisation. Syncs clients, check-ins (with photos), progress metrics, habits, chat messages, workout programs, and exercises. Includes media download tracking for photos and attachments
-- **Docker & Cloud** — Production-ready Dockerfile for Azure Container Instances, AWS Lambda (container), and Kubernetes
+- **Docker & Cloud** — Production-ready Dockerfile for Azure Container Instances, AWS Lambda (container), and Kubernetes, with a `/health` endpoint for orchestrator probes
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
+- **Quality Gates** — CI enforces `ruff` (PEP 8, PEP 257, bandit), `mypy --strict`, a coverage floor over 944 tests on Python 3.12 and 3.13, and a `pip-audit` of the locked dependency set
 
 ## Requirements
 
@@ -30,17 +35,20 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 
 ## Installation
 
-```bash
-pip install kahunas-client
-```
-
-Or install from source:
+The package is not published to PyPI yet, so install it from source:
 
 ```bash
 git clone https://github.com/api-py/kahunas-python-client.git
 cd kahunas-python-client
+
+# With uv (recommended: installs the exact locked versions)
+uv sync --all-extras
+
+# Or with pip
 pip install -e ".[dev]"
 ```
+
+This installs two console commands, `kahunas` and `kahunas-mcp`.
 
 ## Configuration
 
@@ -53,9 +61,9 @@ export KAHUNAS_EMAIL="you@example.com"
 export KAHUNAS_PASSWORD="your-password"
 
 # Optional: WhatsApp Business API
-export WHATSAPP_TOKEN="your-meta-cloud-api-token"
-export WHATSAPP_PHONE_NUMBER_ID="your-whatsapp-phone-number-id"
-export WHATSAPP_DEFAULT_COUNTRY_CODE="44"  # UK default
+export KAHUNAS_WHATSAPP_TOKEN="your-meta-cloud-api-token"
+export KAHUNAS_WHATSAPP_PHONE_NUMBER_ID="your-whatsapp-phone-number-id"
+export KAHUNAS_WHATSAPP_DEFAULT_COUNTRY_CODE="44"  # UK default
 
 # Optional: Calendar Sync
 export KAHUNAS_CALENDAR_PREFIX="Workout"       # Event title prefix
@@ -92,16 +100,27 @@ export KAHUNAS_PERSONA_SLEEP_MINIMUM="7.0"          # Sleep threshold
 export KAHUNAS_PERSONA_STEP_MINIMUM="5000"          # Step threshold
 
 # Optional: Incremental Data Sync
-export KAHUNAS_SYNC_DB="~/.kahunas/sync.db"  # SQLite database path
+export KAHUNAS_SYNC_DB="~/.kahunas/sync.db"     # SQLite database path
+export KAHUNAS_METRICS_DB="~/.kahunas/metrics.db"  # Local metrics database
+
+# Optional: Generated output (charts, .ics files)
+export KAHUNAS_OUTPUT_DIR="~/.kahunas/output"   # Created with 0700 permissions
 ```
+
+> **Handling of local data.** The SQLite databases hold client personal and
+> health data, and generated charts and calendar files carry client names.
+> Both databases and the output directory are created with owner only
+> permissions, and `config.yaml`, `*.db` and `.kahunas/` are in
+> `.gitignore` so credentials and client data cannot be committed by
+> accident.
 
 ### 2. `.env` File
 
 ```env
 KAHUNAS_EMAIL=you@example.com
 KAHUNAS_PASSWORD=your-password
-WHATSAPP_TOKEN=your-meta-cloud-api-token
-WHATSAPP_PHONE_NUMBER_ID=your-whatsapp-phone-number-id
+KAHUNAS_WHATSAPP_TOKEN=your-meta-cloud-api-token
+KAHUNAS_WHATSAPP_PHONE_NUMBER_ID=your-whatsapp-phone-number-id
 KAHUNAS_WEIGHT_UNIT=lbs
 KAHUNAS_HEIGHT_UNIT=inches
 KAHUNAS_TIMEZONE=America/New_York
@@ -165,6 +184,8 @@ asyncio.run(main())
 ### Generating Progress Charts
 
 ```python
+from pathlib import Path
+
 from kahunas_client.charts import generate_chart
 
 # Data points from the Kahunas API (or manual entry)
@@ -180,7 +201,9 @@ png_bytes = generate_chart(
     metric="weight",  # weight, bodyfat, steps, chest, waist, etc.
     time_range="quarter",  # week, month, quarter, year, all
     client_name="John Doe",
-    output_path="/tmp/weight_chart.png",
+    # Charts carry client names, so write them somewhere private rather
+    # than into a shared directory such as /tmp.
+    output_path=Path.home() / ".kahunas/output/weight_chart.png",
 )
 ```
 
@@ -288,8 +311,8 @@ Add to your project's `.claude/mcp.json`:
 Run the MCP server over HTTP for remote access from any MCP client:
 
 ```bash
-# CLI
-kahunas serve --transport http --host 0.0.0.0 --port 8000
+# CLI (binds 127.0.0.1 by default)
+kahunas serve --transport http --port 8000
 
 # Or via module
 python -m kahunas_client.mcp http
@@ -297,6 +320,22 @@ python -m kahunas_client.mcp http
 # Or via environment variables
 KAHUNAS_MCP_TRANSPORT=http KAHUNAS_MCP_PORT=8000 kahunas-mcp
 ```
+
+> **Security.** The server exposes all 75 tools with your Kahunas
+> credentials and performs no authentication of its own. Anyone who can
+> reach the port can read and modify your entire coaching account. It
+> therefore binds `127.0.0.1` by default. Exposing it more widely is a
+> deliberate step:
+>
+> ```bash
+> kahunas serve --transport http --host 0.0.0.0 --port 8000
+> KAHUNAS_MCP_HOST=0.0.0.0 kahunas-mcp http
+> ```
+>
+> Only do that behind something that authenticates callers, such as a
+> reverse proxy, an API gateway, or a private network. The container image
+> sets `KAHUNAS_MCP_HOST=0.0.0.0` because the container boundary is the
+> thing being published.
 
 Connect from an MCP client using the SSE/HTTP endpoint:
 
@@ -309,6 +348,21 @@ Connect from an MCP client using the SSE/HTTP endpoint:
   }
 }
 ```
+
+### Health Endpoint
+
+The HTTP transports serve `GET /health` for container orchestrators:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","service":"kahunas-mcp"}
+```
+
+It reports process liveness only and makes no call to the Kahunas API, so
+a brief upstream outage does not cause an orchestrator to restart a
+healthy container. It requires no authentication, which is what lets a
+probe run before any login. The Dockerfile `HEALTHCHECK` uses it, as do
+the Azure Container Instances and Kubernetes probes.
 
 ### Available MCP Tools
 
@@ -692,6 +746,9 @@ src/kahunas_client/
 ├── data_sync.py          # Incremental SQLite sync (clients, check-ins, progress, habits, chat)
 ├── phone_alignment.py    # Phone number alignment (Kahunas vs WhatsApp E.164)
 ├── whatsapp.py           # WhatsApp Business API client
+├── jsonutil.py           # Defensive narrowing of loosely typed API payloads
+├── safepath.py           # Filename and path sanitisation for remote data
+├── dbsecurity.py         # Owner only permissions for the local SQLite stores
 ├── models/               # Pydantic v2 models
 │   ├── auth.py           # Auth credentials/session
 │   ├── clients.py        # Client, CheckIn, Habit, ChatMessage
@@ -702,6 +759,7 @@ src/kahunas_client/
 │   ├── server.py         # 75 tool definitions (compact JSON, contextvars isolation)
 │   ├── export.py         # Excel export manager (async I/O)
 │   ├── lambda_handler.py # AWS Lambda handler (Mangum)
+│   ├── transport.py      # Transport name validation at the process boundary
 │   └── __main__.py       # Entry point (stdio, http, sse, streamable-http)
 └── cli/                  # CLI (Click + Rich)
     └── main.py           # Command definitions
@@ -710,22 +768,70 @@ src/kahunas_client/
 ## Development
 
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+# Install the exact locked versions, including dev tools
+uv sync --all-extras
 
-# Run tests
-pytest tests/ -v
+# Run the test suite (944 tests, enforces the coverage floor)
+uv run pytest
 
-# Run linter
-ruff check src/ tests/
+# Lint: PEP 8, PEP 257 docstrings, and bandit security rules
+uv run ruff check .
 
-# Format code
-ruff format src/ tests/
+# Format
+uv run ruff format .
 
-# Run functional tests (requires auth token)
-python tests/functional_test.py
+# Type check under strict mode
+uv run mypy src
+
+# Audit the locked dependencies for known vulnerabilities
+uv export --format requirements-txt --no-emit-project --no-dev -o requirements.lock.txt
+uv run --with pip-audit pip-audit -r requirements.lock.txt
 ```
+
+### Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, and each
+gate is blocking:
+
+| Job | Checks |
+| --- | --- |
+| Quality | `ruff check`, `ruff format --check`, `mypy --strict` |
+| Tests | Full suite on Python 3.12 and 3.13, against the coverage floor |
+| Audit | `pip-audit` over the locked dependency set |
+| Build | Wheel and sdist, `twine check`, and an isolated install smoke test |
+
+Every job installs with `uv sync --locked`, so a dependency change cannot
+land without its lockfile update.
+
+### Standards
+
+The build enforces these rather than relying on convention:
+
+- **PEP 8** layout, naming and import ordering (`ruff` `E`, `W`, `N`, `I`)
+- **PEP 257** docstrings on every public module, class and function (`D`)
+- **PEP 484** and **PEP 526** typing under `mypy --strict`, with **PEP 561**
+  typing information shipped via `py.typed`
+- **PEP 585** and **PEP 604** modern syntax (`UP`)
+- **PEP 517**, **PEP 621** and **PEP 440** packaging, verified by the build job
+- Security rules from `bandit` (`S`)
+
+The line length is 100 rather than PEP 8's 79, which PEP 8 explicitly
+permits a team to agree.
+
+### Functional Tests
+
+`tests/functional_test.py` runs against the live Kahunas API and is
+excluded from the default test run. It needs a real token:
+
+```bash
+export KAHUNAS_AUTH_TOKEN="your-token"
+uv run python tests/functional_test.py
+```
+
+A token grants full access to your account, so it is read from the
+environment or from a file whose permissions are checked first. Never
+place it in a shared location such as `/tmp`.
 
 ## License
 
-MIT
+MIT. See [`LICENSE`](LICENSE).
