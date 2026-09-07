@@ -143,6 +143,7 @@ export KAHUNAS_AUTH_TOKEN="your-744-character-token"
 import asyncio
 from kahunas_client import KahunasClient, KahunasConfig
 
+
 async def main():
     config = KahunasConfig(email="you@example.com", password="your-password")
 
@@ -156,6 +157,7 @@ async def main():
         exercises = await client.search_exercises("squat")
         for ex in exercises:
             print(f"{ex.exercise_name} ({ex.exercise_type})")
+
 
 asyncio.run(main())
 ```
@@ -175,8 +177,8 @@ data = [
 # Generate a PNG chart
 png_bytes = generate_chart(
     data_points=data,
-    metric="weight",          # weight, bodyfat, steps, chest, waist, etc.
-    time_range="quarter",     # week, month, quarter, year, all
+    metric="weight",  # weight, bodyfat, steps, chest, waist, etc.
+    time_range="quarter",  # week, month, quarter, year, all
     client_name="John Doe",
     output_path="/tmp/weight_chart.png",
 )
@@ -188,8 +190,8 @@ png_bytes = generate_chart(
 from kahunas_client.whatsapp import WhatsAppClient, WhatsAppConfig, normalise_phone
 
 # Normalise phone numbers (resilient to format variations)
-normalise_phone("07700 900 123")     # -> "447700900123"
-normalise_phone("+44 7700 900123")   # -> "447700900123"
+normalise_phone("07700 900 123")  # -> "447700900123"
+normalise_phone("+44 7700 900123")  # -> "447700900123"
 normalise_phone("0044 7700 900123")  # -> "447700900123"
 
 # Send messages
