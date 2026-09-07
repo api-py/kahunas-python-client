@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .dbsecurity import prepare_db_directory, restrict_db_permissions
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DB_PATH = "~/.kahunas/sync.db"
@@ -236,13 +238,16 @@ class SyncStore:
     def __init__(self, db_path: str | None = None) -> None:
         resolved = db_path or os.getenv("KAHUNAS_SYNC_DB") or _DEFAULT_DB_PATH
         self._db_path = Path(resolved).expanduser()
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_db_directory(self._db_path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        # Applied after the schema is written, so the WAL and shared memory
+        # files SQLite creates alongside the database are covered too.
+        restrict_db_permissions(self._db_path)
 
     def __enter__(self) -> SyncStore:
         return self

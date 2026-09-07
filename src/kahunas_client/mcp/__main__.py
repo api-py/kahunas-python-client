@@ -6,7 +6,7 @@ Transport modes:
     sse              — legacy SSE-only transport
 
 Environment variables for HTTP mode:
-    KAHUNAS_MCP_HOST  — bind address (default: 0.0.0.0)
+    KAHUNAS_MCP_HOST  — bind address (default: 127.0.0.1)
     KAHUNAS_MCP_PORT  — port number  (default: 8000)
 """
 
@@ -35,7 +35,11 @@ def main() -> None:
         server.run(transport=transport)
         return
 
-    host = os.getenv("KAHUNAS_MCP_HOST", "0.0.0.0")
+    # Loopback by default: the MCP transport exposes every tool with the
+    # coach's credentials and performs no authentication of its own, so
+    # binding a routable address has to be a deliberate choice. Container
+    # images set KAHUNAS_MCP_HOST explicitly.
+    host = os.getenv("KAHUNAS_MCP_HOST", "127.0.0.1")
     raw_port = os.getenv("KAHUNAS_MCP_PORT", "8000")
     try:
         port = int(raw_port)

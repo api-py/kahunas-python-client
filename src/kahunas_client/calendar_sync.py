@@ -15,6 +15,7 @@ Configuration:
 from __future__ import annotations
 
 import logging
+import re
 import uuid as _uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -24,6 +25,14 @@ logger = logging.getLogger(__name__)
 # iCal constants
 _ICAL_VERSION = "2.0"
 _ICAL_PRODID = "-//Kahunas//Python Client//EN"
+
+# RFC 5545 section 3.1: content lines are folded at 75 octets.
+_MAX_LINE_OCTETS = 75
+
+# UID and X- properties are not TEXT typed, so they are filtered rather
+# than escaped. Anything outside this set is dropped.
+_UNSAFE_IDENTIFIER_CHARS = re.compile(r"[^A-Za-z0-9._@-]")
+_MAX_IDENTIFIER_LENGTH = 200
 
 
 class CalendarConfig:
@@ -257,7 +266,7 @@ def generate_ics(
         lines.extend(vevent)
 
     lines.append("END:VCALENDAR")
-    return "\r\n".join(lines)
+    return "\r\n".join(_fold_line(line) for line in lines)
 
 
 def _appointment_to_vevent(
@@ -308,7 +317,7 @@ def _appointment_to_vevent(
 
     lines = [
         "BEGIN:VEVENT",
-        f"UID:kahunas-{kahunas_uuid}@kahunas.io",
+        f"UID:kahunas-{_ical_identifier(kahunas_uuid)}@kahunas.io",
         f"DTSTAMP:{dtstamp}",
         f"DTSTART:{dtstart}",
         f"DTEND:{dtend}",
@@ -318,7 +327,7 @@ def _appointment_to_vevent(
         lines.append(f"DESCRIPTION:{_ical_escape(desc)}")
     if location:
         lines.append(f"LOCATION:{_ical_escape(location)}")
-    lines.append(f"X-KAHUNAS-UUID:{kahunas_uuid}")
+    lines.append(f"X-KAHUNAS-UUID:{_ical_identifier(kahunas_uuid)}")
     lines.append("STATUS:CONFIRMED")
     lines.append("END:VEVENT")
     return lines
@@ -501,11 +510,61 @@ def _parse_datetime(raw: str) -> datetime:
 
 
 def _dt_to_ical(dt: datetime) -> str:
-    """Format a datetime as an iCal UTC timestamp (YYYYMMDDTHHMMSSZ)."""
-    utc_dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt
+    """Format a datetime as an iCal UTC timestamp (``YYYYMMDDTHHMMSSZ``).
+
+    A naive datetime is interpreted as UTC rather than being stamped with a
+    ``Z`` suffix unconverted, which previously mislabelled a local time as
+    UTC and shifted the appointment by the host's offset.
+    """
+    utc_dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
     return utc_dt.strftime("%Y%m%dT%H%M%SZ")
 
 
 def _ical_escape(text: str) -> str:
-    """Escape special characters for iCal text fields."""
-    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    """Escape special characters for an iCal TEXT value (RFC 5545 section 3.3.11).
+
+    Carriage returns matter as much as newlines: an unescaped CR ends the
+    content line, so text carrying one could inject further calendar
+    properties into the generated file. CRLF pairs collapse to a single
+    escaped newline so a Windows authored note does not become two.
+    """
+    escaped = text.replace("\\", "\\\\")
+    escaped = escaped.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+    return escaped.replace(";", "\\;").replace(",", "\\,")
+
+
+def _ical_identifier(value: str) -> str:
+    """Reduce ``value`` to characters that are safe in a non TEXT property.
+
+    UID and X- properties are not TEXT typed, so backslash escaping does not
+    apply to them and an embedded newline would terminate the content line.
+    Anything outside a conservative identifier set is dropped rather than
+    escaped.
+    """
+    return _UNSAFE_IDENTIFIER_CHARS.sub("", value)[:_MAX_IDENTIFIER_LENGTH]
+
+
+def _fold_line(line: str) -> str:
+    """Fold one content line to 75 octets, as RFC 5545 section 3.1 requires.
+
+    Folding is measured in octets, not characters, so a multi byte character
+    is never split across the boundary. Continuation lines begin with a
+    single space.
+    """
+    encoded = line.encode("utf-8")
+    if len(encoded) <= _MAX_LINE_OCTETS:
+        return line
+
+    chunks: list[str] = []
+    current = bytearray()
+    limit = _MAX_LINE_OCTETS
+    for char in line:
+        char_bytes = char.encode("utf-8")
+        if len(current) + len(char_bytes) > limit:
+            chunks.append(current.decode("utf-8"))
+            current = bytearray()
+            # Continuation lines spend one octet on the leading space.
+            limit = _MAX_LINE_OCTETS - 1
+        current += char_bytes
+    chunks.append(current.decode("utf-8"))
+    return "\r\n ".join(chunks)

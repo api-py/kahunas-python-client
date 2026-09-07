@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .dbsecurity import prepare_db_directory, restrict_db_permissions
+
 logger = logging.getLogger(__name__)
 
 # All supported metrics with default metadata.
@@ -114,7 +116,7 @@ class MetricsStore:
             db_path = Path(env_path) if env_path else _DEFAULT_DB_PATH
 
         self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_db_directory(self._db_path)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
 
@@ -123,6 +125,8 @@ class MetricsStore:
             self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(_SCHEMA)
+            # The store holds client measurements, so keep it owner only.
+            restrict_db_permissions(self._db_path)
         return self._conn
 
     def close(self) -> None:

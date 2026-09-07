@@ -25,6 +25,19 @@ env/
 .env
 *.pem
 *.key
+# README instructs copying config.example.yaml to config.yaml and filling in
+# a real password, so the working copy must never be committable.
+config.yaml
+config.yml
+persona.txt
+
+# Local databases and generated output hold client personal and health data
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.kahunas/
+kahunas_output/
 
 # OS
 .DS_Store

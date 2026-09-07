@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import click
+from click.core import ParameterSource
 from rich.console import Console
 from rich.table import Table
 
@@ -43,7 +44,13 @@ def _load_config(ctx: click.Context) -> KahunasConfig:
 
 @click.group()
 @click.option("--email", envvar="KAHUNAS_EMAIL", default="", help="Account email")
-@click.option("--password", envvar="KAHUNAS_PASSWORD", default="", help="Account password")
+@click.option(
+    "--password",
+    envvar="KAHUNAS_PASSWORD",
+    default="",
+    help="Account password. Prefer the KAHUNAS_PASSWORD environment variable: "
+    "a value given here is visible in the process list and shell history.",
+)
 @click.option("--token", envvar="KAHUNAS_AUTH_TOKEN", default="", help="Auth token (skips login)")
 @click.option("--config", envvar="KAHUNAS_CONFIG_FILE", default="", help="Path to YAML config file")
 @click.version_option(package_name="kahunas-client")
@@ -51,6 +58,13 @@ def _load_config(ctx: click.Context) -> KahunasConfig:
 def cli(ctx: click.Context, email: str, password: str, token: str, config: str) -> None:
     """Kahunas — fitness coaching platform CLI."""
     ctx.ensure_object(dict)
+    if password and ctx.get_parameter_source("password") is ParameterSource.COMMANDLINE:
+        click.echo(
+            "Warning: a password passed on the command line is visible to other "
+            "users via the process list and is recorded in shell history. "
+            "Set KAHUNAS_PASSWORD instead.",
+            err=True,
+        )
     ctx.obj["email"] = email
     ctx.obj["password"] = password
     ctx.obj["token"] = token
@@ -322,7 +336,13 @@ def export_workouts(ctx: click.Context, output: str) -> None:
     default="stdio",
     help="MCP transport protocol (default: stdio)",
 )
-@click.option("--host", "-H", default="0.0.0.0", help="Bind address for HTTP transport")
+@click.option(
+    "--host",
+    "-H",
+    default="127.0.0.1",
+    help="Bind address for HTTP transport. Defaults to loopback; the server has "
+    "no authentication, so bind a routable address only behind one.",
+)
 @click.option("--port", "-p", default=8000, type=int, help="Port for HTTP transport")
 def serve(transport: str, host: str, port: int) -> None:
     """Start the MCP server."""
