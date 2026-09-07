@@ -808,7 +808,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },
-    { name = "rich", specifier = ">=13.0,<14.0" },
+    { name = "rich", specifier = ">=13.0,<15.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3" },
     { name = "tenacity", specifier = ">=8.2,<10.0" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
