@@ -18,6 +18,7 @@ from ..checkin_reminders import build_reminder_message, find_overdue_clients
 from ..client import KahunasClient
 from ..config import KahunasConfig
 from ..data_sync import SyncStore
+from ..jsonutil import as_dict_list, first_list
 from ..metrics_store import (
     MEASUREMENT_SETTINGS,
     MetricsStore,
@@ -400,13 +401,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             return _compact({"error": "Could not parse check-in data", "raw": resp.text[:200]})
 
         # Extract check-ins from response
-        checkins: list[dict[str, Any]] = []
-        if isinstance(data, dict):
-            checkins = data.get("checkins", data.get("check_ins", data.get("data", [])))
-            if isinstance(checkins, dict):
-                checkins = checkins.get("checkins", checkins.get("check_ins", []))
-        elif isinstance(data, list):
-            checkins = data
+        checkins = as_dict_list(first_list(data, "checkins", "check_ins", "data"))
 
         if not checkins:
             return _compact(
@@ -547,15 +542,11 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         # Parse chart data from response
         data_points: list[dict[str, Any]] = []
         try:
-            raw = resp.json()
-            if isinstance(raw, list):
-                data_points = raw
-            elif isinstance(raw, dict):
-                data_points = raw.get("data", raw.get("chart_data", []))
-                if isinstance(data_points, dict):
-                    data_points = []
-        except Exception:
-            pass
+            data_points = as_dict_list(first_list(resp.json(), "data", "chart_data"))
+        except ValueError:
+            logger.warning(
+                "Chart data for client %s metric %s was not valid JSON", client_uuid, metric
+            )
 
         # Determine output path
         if not output_path:
@@ -686,11 +677,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": "Could not fetch clients"})
 
-        clients_list = []
-        if isinstance(data, dict):
-            clients_list = data.get("data", data.get("clients", []))
-        elif isinstance(data, list):
-            clients_list = data
+        clients_list = as_dict_list(first_list(data, "data", "clients"))
 
         if not isinstance(clients_list, list):
             return _compact({"error": "Unexpected client data format"})
@@ -748,11 +735,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR, "raw": resp.text[:200]})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -821,11 +804,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -900,11 +879,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -960,11 +935,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -1024,11 +995,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         overview = build_appointment_overview(events)
         return _compact(overview)
@@ -1053,11 +1020,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         counts = build_client_appointment_counts(events, client_uuid, client_name)
         return _compact(counts)
@@ -1116,11 +1079,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -1288,11 +1247,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             try:
                 resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
                 data = resp.json()
-                events = []
-                if isinstance(data, list):
-                    events = data
-                elif isinstance(data, dict):
-                    events = data.get("data", data.get("events", []))
+                events = as_dict_list(first_list(data, "data", "events"))
 
                 client_events = []
                 for evt in events:
@@ -1514,13 +1469,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         data_points: list[dict[str, Any]] = []
         try:
-            raw = resp.json()
-            if isinstance(raw, list):
-                data_points = raw
-            elif isinstance(raw, dict):
-                data_points = raw.get("data", raw.get("chart_data", []))
-                if isinstance(data_points, dict):
-                    data_points = []
+            data_points = as_dict_list(first_list(resp.json(), "data", "chart_data"))
         except Exception:
             return _compact({"error": "Could not parse API response"})
 
@@ -2215,15 +2164,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             try:
                 ci_resp = await client.list_client_checkins(uuid)
                 ci_data = ci_resp.json()
-                checkins: list[dict[str, Any]] = []
-                if isinstance(ci_data, dict):
-                    checkins = ci_data.get(
-                        "checkins", ci_data.get("check_ins", ci_data.get("data", []))
-                    )
-                    if isinstance(checkins, dict):
-                        checkins = checkins.get("checkins", checkins.get("check_ins", []))
-                elif isinstance(ci_data, list):
-                    checkins = ci_data
+                checkins = as_dict_list(first_list(ci_data, "checkins", "check_ins", "data"))
                 if checkins:
                     ci_result = await asyncio.to_thread(sync.upsert_checkins, uuid, checkins)
                     checkin_total += ci_result["checkins"]
@@ -2237,15 +2178,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                     p_resp = await client.get_chart_data(uuid, value=metric, range_type="all")
                     p_data: list[dict[str, Any]] = []
                     try:
-                        raw = p_resp.json()
-                        if isinstance(raw, list):
-                            p_data = raw
-                        elif isinstance(raw, dict):
-                            p_data = raw.get("data", raw.get("chart_data", []))
-                            if isinstance(p_data, dict):
-                                p_data = []
-                    except Exception:
-                        pass
+                        p_data = as_dict_list(first_list(p_resp.json(), "data", "chart_data"))
+                    except ValueError:
+                        logger.warning("Skipping %s progress: response was not JSON", metric)
                     if p_data:
                         progress_total += await asyncio.to_thread(
                             sync.upsert_progress, uuid, metric, p_data
@@ -2347,15 +2282,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         try:
             ci_resp = await client.list_client_checkins(client_uuid)
             ci_data = ci_resp.json()
-            checkins: list[dict[str, Any]] = []
-            if isinstance(ci_data, dict):
-                checkins = ci_data.get(
-                    "checkins", ci_data.get("check_ins", ci_data.get("data", []))
-                )
-                if isinstance(checkins, dict):
-                    checkins = checkins.get("checkins", checkins.get("check_ins", []))
-            elif isinstance(ci_data, list):
-                checkins = ci_data
+            checkins = as_dict_list(first_list(ci_data, "checkins", "check_ins", "data"))
             ci_result = await asyncio.to_thread(sync.upsert_checkins, client_uuid, checkins)
             results["checkins"] = ci_result["checkins"]
             results["photos_tracked"] = ci_result["photos"]
@@ -2370,15 +2297,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 p_resp = await client.get_chart_data(client_uuid, value=metric, range_type="all")
                 p_data: list[dict[str, Any]] = []
                 try:
-                    raw = p_resp.json()
-                    if isinstance(raw, list):
-                        p_data = raw
-                    elif isinstance(raw, dict):
-                        p_data = raw.get("data", raw.get("chart_data", []))
-                        if isinstance(p_data, dict):
-                            p_data = []
-                except Exception:
-                    pass
+                    p_data = as_dict_list(first_list(p_resp.json(), "data", "chart_data"))
+                except ValueError:
+                    logger.warning("Skipping %s progress: response was not JSON", metric)
                 if p_data:
                     progress_total += await asyncio.to_thread(
                         sync.upsert_progress, client_uuid, metric, p_data

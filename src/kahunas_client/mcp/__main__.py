@@ -16,25 +16,33 @@ import os
 import sys
 
 from .server import create_server
+from .transport import parse_transport
 
 
 def main() -> None:
-    transport = os.getenv("KAHUNAS_MCP_TRANSPORT", "stdio").lower()
-    if len(sys.argv) > 1 and sys.argv[1] in ("http", "sse", "streamable-http", "stdio"):
-        transport = sys.argv[1]
+    """Start the MCP server on the transport named by argv or the environment."""
+    raw_transport = (
+        sys.argv[1] if len(sys.argv) > 1 else os.getenv("KAHUNAS_MCP_TRANSPORT", "stdio")
+    )
+    try:
+        transport = parse_transport(raw_transport)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     server = create_server()
 
-    if transport in ("http", "sse", "streamable-http"):
-        host = os.getenv("KAHUNAS_MCP_HOST", "0.0.0.0")
-        port = int(os.getenv("KAHUNAS_MCP_PORT", "8000"))
-        server.run(
-            transport=transport,
-            host=host,
-            port=port,
-        )
-    else:
-        server.run(transport="stdio")
+    if transport == "stdio":
+        server.run(transport=transport)
+        return
+
+    host = os.getenv("KAHUNAS_MCP_HOST", "0.0.0.0")
+    raw_port = os.getenv("KAHUNAS_MCP_PORT", "8000")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        sys.exit(f"KAHUNAS_MCP_PORT must be an integer, got {raw_port!r}.")
+
+    server.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":

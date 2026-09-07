@@ -36,6 +36,8 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.3",
     "types-PyYAML>=6.0",
+    "types-openpyxl>=3.1",
+    "pip-audit>=2.7",
 ]
 
 [project.scripts]
@@ -54,7 +56,13 @@ python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+warn_unused_ignores = true
 plugins = ["pydantic.mypy"]
+
+# matplotlib.dates ships unannotated locator and formatter constructors.
+# Exempt calls *into* matplotlib only; strict mode still applies in full to
+# every call between our own modules.
+untyped_calls_exclude = ["matplotlib"]
 
 [tool.ruff]
 target-version = "py312"

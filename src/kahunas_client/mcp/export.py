@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.worksheet import Worksheet
+
+from ..jsonutil import as_dict, as_str, first_list
 
 if TYPE_CHECKING:
     from ..client import KahunasClient
@@ -31,6 +34,27 @@ def _sanitize_name(name: str) -> str:
 
 def _timestamp() -> str:
     return datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+
+
+def _titled_sheet(wb: Workbook, title: str) -> Worksheet:
+    """Return the workbook's default sheet under ``title``, creating it if absent.
+
+    ``Workbook.active`` is optional: a workbook whose sheets have all been
+    removed has no active sheet. Creating one on demand keeps every export
+    path total instead of raising ``AttributeError`` on an edge case.
+    """
+    sheet = wb.active
+    if not isinstance(sheet, Worksheet):
+        sheet = wb.create_sheet()
+    sheet.title = title
+    return sheet
+
+
+def _drop_default_sheet(wb: Workbook) -> None:
+    """Remove the sheet openpyxl creates automatically, when there is one."""
+    sheet = wb.active
+    if sheet is not None:
+        wb.remove(sheet)
 
 
 def _add_header_row(ws: Any, headers: list[str]) -> None:
@@ -118,17 +142,12 @@ class ExportManager:
         resp = await self._client.list_clients()
         clients_data = self._parse_response(resp)
 
-        clients = []
-        if isinstance(clients_data, dict):
-            clients = clients_data.get("data", clients_data.get("clients", []))
-        if isinstance(clients_data, list):
-            clients = clients_data
+        clients = first_list(clients_data, "data", "clients")
 
         if not clients:
             # Write empty summary
             wb = Workbook()
-            ws = wb.active
-            ws.title = "Clients"
+            ws = _titled_sheet(wb, "Clients")
             _add_header_row(ws, ["Status"])
             ws.cell(row=2, column=1, value="No clients found")
             await asyncio.to_thread(wb.save, base / "clients_summary.xlsx")
@@ -151,8 +170,7 @@ class ExportManager:
         filepath = base / "exercise_library.xlsx"
 
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Exercises"
+        ws = _titled_sheet(wb, "Exercises")
 
         headers = [
             "Name",
@@ -226,7 +244,7 @@ class ExportManager:
 
         wb = Workbook()
         # Remove default sheet
-        wb.remove(wb.active)
+        _drop_default_sheet(wb)
 
         if not program.workout_days:
             ws = wb.create_sheet("Overview")
@@ -289,8 +307,7 @@ class ExportManager:
     def _export_client_profile(self, client_dir: Path, client_data: Any) -> None:
         """Export client profile to Excel."""
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Profile"
+        ws = _titled_sheet(wb, "Profile")
 
         # Row 1: header
         for col, header in enumerate(["Field", "Value"], 1):
@@ -325,16 +342,13 @@ class ExportManager:
         resp = await self._client.get_client_action("view", client_uuid)
         data = self._parse_response(resp)
 
-        checkins = []
-        if isinstance(data, dict):
-            checkins = data.get("checkins", data.get("check_ins", []))
+        checkins = first_list(data, "checkins", "check_ins")
 
         if not checkins:
             return
 
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Check-ins Summary"
+        ws = _titled_sheet(wb, "Check-ins Summary")
         _add_header_row(ws, ["#", "Date", "UUID", "Status"])
 
         for i, ci in enumerate(checkins, 1):
@@ -362,7 +376,7 @@ class ExportManager:
 
         metrics = ["weight", "bodyfat", "chest", "waist", "hips", "arms", "thighs"]
         wb = Workbook()
-        wb.remove(wb.active)
+        _drop_default_sheet(wb)
 
         for metric in metrics:
             try:
@@ -395,11 +409,7 @@ class ExportManager:
         resp = await self._client.list_habits(client_uuid)
         data = self._parse_response(resp)
 
-        habits = []
-        if isinstance(data, dict):
-            habits = data.get("habits", data.get("data", []))
-        if isinstance(data, list):
-            habits = data
+        habits = first_list(data, "habits", "data")
 
         if not habits:
             return
@@ -408,8 +418,7 @@ class ExportManager:
         habits_dir.mkdir(exist_ok=True)
 
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Habits"
+        ws = _titled_sheet(wb, "Habits")
         _add_header_row(ws, ["Habit", "Date", "Completed", "UUID"])
 
         for i, habit in enumerate(habits, 2):
@@ -426,11 +435,7 @@ class ExportManager:
         resp = await self._client.get_chat_messages(client_uuid)
         data = self._parse_response(resp)
 
-        messages = []
-        if isinstance(data, dict):
-            messages = data.get("messages", data.get("data", []))
-        if isinstance(data, list):
-            messages = data
+        messages = first_list(data, "messages", "data")
 
         if not messages:
             return
@@ -439,8 +444,7 @@ class ExportManager:
         chat_dir.mkdir(exist_ok=True)
 
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Messages"
+        ws = _titled_sheet(wb, "Messages")
         _add_header_row(ws, ["Date", "From", "Message", "Read"])
 
         for i, msg in enumerate(messages, 2):
@@ -462,7 +466,11 @@ class ExportManager:
                 if isinstance(photo, str):
                     url = photo
                 elif isinstance(photo, dict):
-                    url = photo.get("file_url", photo.get("url", photo.get("image_url", "")))
+                    url = (
+                        as_str(photo.get("file_url"))
+                        or as_str(photo.get("url"))
+                        or as_str(photo.get("image_url"))
+                    )
 
                 if not url:
                     continue
@@ -488,11 +496,10 @@ class ExportManager:
     def _extract_client_name(data: Any, fallback: str) -> str:
         """Extract a readable client name from response data."""
         if isinstance(data, dict):
-            d = data.get("data", data)
-            if isinstance(d, dict):
-                first = d.get("first_name", "")
-                last = d.get("last_name", "")
-                if first or last:
-                    return f"{first} {last}".strip()
-                return d.get("name", d.get("email", fallback))
+            d = as_dict(data.get("data")) or data
+            first = as_str(d.get("first_name"))
+            last = as_str(d.get("last_name"))
+            if first or last:
+                return f"{first} {last}".strip()
+            return as_str(d.get("name")) or as_str(d.get("email")) or fallback
         return fallback

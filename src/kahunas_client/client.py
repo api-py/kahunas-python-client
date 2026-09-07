@@ -24,6 +24,7 @@ from .exceptions import (
     TokenExpiredError,
     ValidationError,
 )
+from .jsonutil import as_dict
 from .models import (
     AuthSession,
     Exercise,
@@ -202,9 +203,16 @@ class KahunasClient:
             )
 
         try:
-            data = resp.json()
+            raw = resp.json()
         except Exception as exc:
             raise KahunasError(f"Invalid JSON response: {resp.text[:200]}") from exc
+
+        if not isinstance(raw, dict):
+            raise KahunasError(
+                f"Expected a JSON object from {resp.request.method} {resp.request.url.path}, "
+                f"got {type(raw).__name__}: {resp.text[:200]}"
+            )
+        data: dict[str, Any] = raw
 
         # Handle token expiration with automatic re-auth
         if data.get("token_expired") and not data.get("updated_token"):
@@ -316,14 +324,14 @@ class KahunasClient:
             "v1/workoutprogram/replicate",
             json_data={"uuid": uuid, "client_uuid": client_uuid},
         )
-        return resp.get("data", {})
+        return as_dict(resp.get("data"))
 
     async def restore_workout_program(self, uuid: str) -> dict[str, Any]:
         """Restore an archived workout program."""
         resp = await self._api_request(
             "POST", "v1/workoutprogram/restoreprogram", json_data={"uuid": uuid}
         )
-        return resp.get("data", {})
+        return as_dict(resp.get("data"))
 
     # ── REST API: Exercises ──
 

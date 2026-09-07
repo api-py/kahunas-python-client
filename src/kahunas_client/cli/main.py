@@ -13,6 +13,7 @@ from rich.table import Table
 from ..client import KahunasClient
 from ..config import KahunasConfig
 from ..mcp.export import ExportManager
+from ..mcp.transport import TRANSPORTS, parse_transport
 
 console = Console()
 
@@ -317,7 +318,7 @@ def export_workouts(ctx: click.Context, output: str) -> None:
 @click.option(
     "--transport",
     "-t",
-    type=click.Choice(["stdio", "http", "sse", "streamable-http"]),
+    type=click.Choice(TRANSPORTS),
     default="stdio",
     help="MCP transport protocol (default: stdio)",
 )
@@ -328,10 +329,11 @@ def serve(transport: str, host: str, port: int) -> None:
     from ..mcp.server import create_server
 
     server = create_server()
-    if transport in ("http", "sse", "streamable-http"):
-        server.run(transport=transport, host=host, port=port)
+    selected = parse_transport(transport)
+    if selected == "stdio":
+        server.run(transport=selected)
     else:
-        server.run(transport="stdio")
+        server.run(transport=selected, host=host, port=port)
 
 
 # ── Raw API ──

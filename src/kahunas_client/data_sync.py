@@ -234,7 +234,7 @@ class SyncStore:
     """Local SQLite mirror of all Kahunas coaching data with delta sync."""
 
     def __init__(self, db_path: str | None = None) -> None:
-        resolved = db_path or os.getenv("KAHUNAS_SYNC_DB", _DEFAULT_DB_PATH)
+        resolved = db_path or os.getenv("KAHUNAS_SYNC_DB") or _DEFAULT_DB_PATH
         self._db_path = Path(resolved).expanduser()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()

@@ -83,11 +83,11 @@ def generate_chart(
     if not dates:
         return _generate_empty_chart(config["label"], time_range, client_name)
 
-    # Sort by date
+    # Sort by date. Rebuilt as new lists rather than reassigning through
+    # zip(*paired), which would swap the element type from list to tuple.
     paired = sorted(zip(dates, values, strict=True), key=lambda x: x[0])
-    dates, values = zip(*paired, strict=True)
-    dates = list(dates)
-    values = list(values)
+    dates = [point_date for point_date, _ in paired]
+    values = [point_value for _, point_value in paired]
 
     # Create the chart
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -96,7 +96,7 @@ def generate_chart(
 
     # Plot line with markers
     ax.plot(
-        dates,
+        dates,  # type: ignore[arg-type]  # matplotlib resolves datetimes via its unit registry
         values,
         color=config["color"],
         linewidth=2,
@@ -109,7 +109,12 @@ def generate_chart(
     )
 
     # Fill area under the line
-    ax.fill_between(dates, values, alpha=0.1, color=config["color"])
+    ax.fill_between(
+        dates,  # type: ignore[arg-type]  # see note on ax.plot above
+        values,
+        alpha=0.1,
+        color=config["color"],
+    )
 
     # Add min/max/latest annotations
     if len(values) >= 2:

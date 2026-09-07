@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from .jsonutil import as_dict
+
 logger = logging.getLogger(__name__)
 
 _GRAPH_API = "https://graph.facebook.com/v21.0"
@@ -251,12 +253,14 @@ class WhatsAppClient:
     def _handle_response(resp: httpx.Response) -> dict[str, Any]:
         """Parse WhatsApp API response, raising on errors."""
         try:
-            data = resp.json()
+            data = as_dict(resp.json())
         except Exception:
+            data = {}
+        if not data:
             data = {"error": {"message": resp.text[:300], "code": resp.status_code}}
 
         if resp.status_code >= 400:
-            err = data.get("error", {})
+            err = as_dict(data.get("error"))
             msg = err.get("message", f"HTTP {resp.status_code}")
             code = err.get("code", resp.status_code)
             raise WhatsAppError(f"WhatsApp API error ({code}): {msg}")

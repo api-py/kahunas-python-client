@@ -17,8 +17,9 @@ import os
 from mangum import Mangum
 
 from .server import create_server
+from .transport import parse_http_transport
 
-_transport = os.getenv("KAHUNAS_MCP_TRANSPORT", "streamable-http")
+_transport = parse_http_transport(os.getenv("KAHUNAS_MCP_TRANSPORT", "streamable-http"))
 _server = create_server()
 _app = _server.http_app(transport=_transport)
 
