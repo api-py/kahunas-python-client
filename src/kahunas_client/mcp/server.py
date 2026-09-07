@@ -10,11 +10,12 @@ import logging
 import os
 import secrets
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 from fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 from ..anomaly_detection import parse_thresholds, scan_client_anomalies
 from ..checkin_reminders import build_reminder_message, find_overdue_clients
@@ -39,6 +40,9 @@ from ..persona import PersonaConfig, build_anomaly_warning, get_persona_summary
 from ..phone_alignment import build_phone_alignment_report
 from ..safepath import safe_filename, safe_join
 from .export import ExportManager
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
 
@@ -244,12 +248,42 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         ),
     )
 
+    # ── Operational endpoints ──
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        """Report liveness for container orchestrators.
+
+        The Dockerfile HEALTHCHECK, and the equivalent probes in Azure
+        Container Instances and Kubernetes, poll this path. Without it the
+        only route served is /mcp, so every probe failed and orchestrators
+        restarted an otherwise healthy container.
+
+        Deliberately reports process liveness only. It performs no call to
+        the Kahunas API, so a container is not restarted because an upstream
+        dependency is briefly unavailable, and the endpoint cannot be used
+        to probe credential validity from outside.
+        """
+        return JSONResponse({"status": "ok", "service": "kahunas-mcp"})
+
     # ── Lifecycle ──
 
     @mcp.tool()
     async def login() -> str:
         """Authenticate with Kahunas. Call this first before using other tools."""
         cfg = config or KahunasConfig.from_env()
+
+        # A second login previously replaced the client without closing the
+        # first, leaking its connection pool for the life of the process.
+        previous = _client_var.get()
+        if previous is not None:
+            try:
+                await previous.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.warning("Closing the previous Kahunas session failed: %s", exc)
+            _client_var.set(None)
+            _export_var.set(None)
+
         client = KahunasClient(cfg)
         try:
             await client.__aenter__()

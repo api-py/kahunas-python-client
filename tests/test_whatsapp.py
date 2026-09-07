@@ -67,9 +67,23 @@ class TestNormalisePhone:
     def test_international_number_keeps_prefix(self) -> None:
         assert normalise_phone("+33612345678") == "33612345678"
 
-    def test_short_number_passthrough(self) -> None:
-        # Very short numbers pass through unchanged
-        assert normalise_phone("12345") == "12345"
+    def test_implausibly_short_number_is_rejected(self) -> None:
+        """No international mobile number is five digits, so it is not a recipient.
+
+        This previously passed through unchanged, so free text in a client's
+        phone field reached the WhatsApp API as a destination.
+        """
+        assert normalise_phone("12345") == ""
+
+    @pytest.mark.parametrize(
+        "junk",
+        ["not a number", "n/a", "TBC", "07700 900123 (mobile)", "ask client", "-", "+"],
+    )
+    def test_non_numeric_input_is_rejected(self, junk: str) -> None:
+        assert normalise_phone(junk) == ""
+
+    def test_absurdly_long_input_is_rejected(self) -> None:
+        assert normalise_phone("1" * 40) == ""
 
 
 class TestPhonesMatch:

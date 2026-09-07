@@ -169,10 +169,15 @@ def generate_chart(
 
     fig.tight_layout(rect=(0, 0.03, 1, 1))
 
-    # Export to PNG bytes
+    # Export to PNG bytes. Closing in a finally matters because pyplot keeps
+    # a global reference to every open figure: a rendering failure here would
+    # otherwise leak the figure for the life of the process, and a long lived
+    # MCP server generates charts repeatedly.
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     buf.seek(0)
     png_bytes = buf.read()
 
@@ -236,7 +241,9 @@ def _generate_empty_chart(label: str, time_range: str, client_name: str) -> byte
     ax.set_yticks([])
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     buf.seek(0)
     return buf.read()

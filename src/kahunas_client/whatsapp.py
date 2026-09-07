@@ -6,9 +6,9 @@ WhatsApp contacts by normalised phone number.
 
 Configuration:
     Set these environment variables or pass via KahunasConfig/WhatsAppConfig:
-    - WHATSAPP_TOKEN: Meta Cloud API access token
-    - WHATSAPP_PHONE_NUMBER_ID: Your WhatsApp Business phone number ID
-    - WHATSAPP_DEFAULT_COUNTRY_CODE: Default country code (default: "44" for UK)
+    - KAHUNAS_WHATSAPP_TOKEN: Meta Cloud API access token
+    - KAHUNAS_WHATSAPP_PHONE_NUMBER_ID: Your WhatsApp Business phone number ID
+    - KAHUNAS_WHATSAPP_DEFAULT_COUNTRY_CODE: Default country code (default: "44" for UK)
 """
 
 from __future__ import annotations
@@ -27,6 +27,11 @@ _GRAPH_API = "https://graph.facebook.com/v21.0"
 
 # Chars to strip when normalising a phone number
 _STRIP_RE = re.compile(r"[\s\-\(\)\.]+")
+
+# A cleaned number: optional leading +, then digits only. E.164 allows at
+# most 15 digits; a leading 00 international prefix or a national trunk 0
+# is still present at this point, so the bound allows for those.
+_E164_CANDIDATE = re.compile(r"\+?\d{6,17}")
 
 
 class WhatsAppConfig:
@@ -79,6 +84,13 @@ def normalise_phone(phone: str, default_country_code: str = "44") -> str:
     if not clean:
         return ""
 
+    # Reject anything that is not a phone number. Previously an unrecognised
+    # format was returned unchanged, so free text in the client's phone field
+    # reached the WhatsApp API as a recipient.
+    if not _E164_CANDIDATE.fullmatch(clean):
+        logger.debug("Ignoring unparseable phone number: %r", phone)
+        return ""
+
     # Handle + prefix
     if clean.startswith("+"):
         return clean[1:]  # remove the + for WhatsApp API format
@@ -96,7 +108,7 @@ def normalise_phone(phone: str, default_country_code: str = "44") -> str:
     if default_country_code == "44" and clean.startswith("7") and len(clean) == 10:
         return "44" + clean
 
-    # Already normalised or unknown format — return as-is
+    # Already normalised, or a format this function does not recognise.
     return clean
 
 
@@ -293,6 +305,8 @@ def match_clients_to_whatsapp(
         phone = client.get("phone", "")
         normalised = normalise_phone(phone, default_country_code)
         client["whatsapp_number"] = normalised
-        # A valid mobile number should be at least 10 digits
-        client["whatsapp_ready"] = len(normalised) >= 10
+        # A valid international mobile number is at least 10 digits. The
+        # normaliser now rejects non numeric input, so a length check here is
+        # a check on digits rather than on arbitrary characters.
+        client["whatsapp_ready"] = len(normalised) >= 10 and normalised.isdigit()
     return clients

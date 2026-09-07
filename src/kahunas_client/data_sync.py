@@ -239,11 +239,14 @@ class SyncStore:
         resolved = db_path or os.getenv("KAHUNAS_SYNC_DB") or _DEFAULT_DB_PATH
         self._db_path = Path(resolved).expanduser()
         prepare_db_directory(self._db_path)
-        self._lock = threading.Lock()
+        # Reentrant: guarded reads may be reached from inside a guarded
+        # section, and a plain Lock would deadlock there.
+        self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
         # Applied after the schema is written, so the WAL and shared memory
         # files SQLite creates alongside the database are covered too.
@@ -259,17 +262,37 @@ class SyncStore:
         for statement in _SCHEMA_SQL.split(";"):
             stmt = statement.strip()
             if stmt:
-                self._conn.execute(stmt)
-        self._conn.commit()
+                self._db.execute(stmt)
+        self._db.commit()
 
     def close(self) -> None:
+        """Close the database connection.
+
+        Idempotent, and holds the lock so it cannot run while another thread
+        is mid query.
+        """
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        """Return the connection, refusing use after the store is closed.
+
+        Reads previously touched the connection with no lock held, so a
+        close on another thread could land between statements and surface
+        as a bare sqlite3.ProgrammingError from deep inside a query.
+        """
+        if self._closed:
+            raise RuntimeError("SyncStore is closed")
+        return self._conn
 
     # ── Sync state ──────────────────────────────────────────────────────
 
     def get_sync_state(self, client_uuid: str, data_type: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT * FROM sync_state WHERE client_uuid=? AND data_type=?",
             (client_uuid, data_type),
         ).fetchone()
@@ -283,7 +306,7 @@ class SyncStore:
         last_id: str = "",
     ) -> None:
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """INSERT INTO sync_state
                    (client_uuid, data_type, last_synced_at, last_id, record_count)
                    VALUES (?, ?, ?, ?, ?)
@@ -293,7 +316,7 @@ class SyncStore:
                                  record_count=excluded.record_count""",
                 (client_uuid, data_type, _now(), last_id, record_count),
             )
-            self._conn.commit()
+            self._db.commit()
 
     # ── Clients ─────────────────────────────────────────────────────────
 
@@ -302,7 +325,7 @@ class SyncStore:
         if not uuid:
             return False
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """INSERT INTO clients
                    (uuid, first_name, last_name, email, phone, status, raw_json, synced_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -321,7 +344,7 @@ class SyncStore:
                     _now(),
                 ),
             )
-            self._conn.commit()
+            self._db.commit()
         return True
 
     def upsert_clients(self, clients: list[dict[str, Any]]) -> int:
@@ -331,7 +354,7 @@ class SyncStore:
                 uuid = c.get("uuid", c.get("id", ""))
                 if not uuid:
                     continue
-                self._conn.execute(
+                self._db.execute(
                     """INSERT INTO clients
                        (uuid, first_name, last_name, email, phone, status, raw_json, synced_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -352,11 +375,11 @@ class SyncStore:
                     ),
                 )
                 count += 1
-            self._conn.commit()
+            self._db.commit()
         return count
 
     def list_clients(self) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             "SELECT uuid, first_name, last_name, email, phone, status, synced_at FROM clients"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -371,7 +394,7 @@ class SyncStore:
         if not uuid:
             return False, 0
         now = _now()
-        self._conn.execute(
+        self._db.execute(
             """INSERT INTO checkins
                (uuid, client_uuid, check_in_number, submitted_at,
                 weight, waist, hips, biceps, thighs,
@@ -416,7 +439,7 @@ class SyncStore:
 
         photo_count = 0
         for url in _extract_photos(checkin):
-            self._conn.execute(
+            self._db.execute(
                 """INSERT INTO checkin_photos
                    (checkin_uuid, client_uuid, photo_url, synced_at)
                    VALUES (?, ?, ?, ?)
@@ -431,7 +454,7 @@ class SyncStore:
         """Upsert a check-in and its photos. Returns (inserted, photo_count)."""
         with self._lock:
             result = self._upsert_checkin_no_commit(client_uuid, checkin)
-            self._conn.commit()
+            self._db.commit()
         return result
 
     def upsert_checkins(self, client_uuid: str, checkins: list[dict[str, Any]]) -> dict[str, int]:
@@ -443,18 +466,18 @@ class SyncStore:
                 if ok:
                     inserted += 1
                 photos += pc
-            self._conn.commit()
+            self._db.commit()
         return {"checkins": inserted, "photos": photos}
 
     def get_client_checkin_count(self, client_uuid: str) -> int:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT COUNT(*) AS cnt FROM checkins WHERE client_uuid=?",
             (client_uuid,),
         ).fetchone()
         return row["cnt"] if row else 0
 
     def get_latest_checkin_number(self, client_uuid: str) -> int:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT MAX(check_in_number) AS max_num FROM checkins WHERE client_uuid=?",
             (client_uuid,),
         ).fetchone()
@@ -477,7 +500,7 @@ class SyncStore:
                 if not date_str or val is None:
                     continue
                 try:
-                    self._conn.execute(
+                    self._db.execute(
                         """INSERT INTO progress_metrics
                            (client_uuid, metric, value, recorded_at, synced_at)
                            VALUES (?, ?, ?, ?, ?)
@@ -488,11 +511,11 @@ class SyncStore:
                     inserted += 1
                 except sqlite3.IntegrityError:
                     pass
-            self._conn.commit()
+            self._db.commit()
         return inserted
 
     def get_progress_count(self, client_uuid: str, metric: str) -> int:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT COUNT(*) AS cnt FROM progress_metrics WHERE client_uuid=? AND metric=?",
             (client_uuid, metric),
         ).fetchone()
@@ -508,7 +531,7 @@ class SyncStore:
                 uuid = h.get("uuid", "")
                 if not uuid:
                     continue
-                self._conn.execute(
+                self._db.execute(
                     """INSERT INTO habits
                        (uuid, client_uuid, title, date, completed, raw_json, synced_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -526,7 +549,7 @@ class SyncStore:
                     ),
                 )
                 inserted += 1
-            self._conn.commit()
+            self._db.commit()
         return inserted
 
     # ── Chat messages ───────────────────────────────────────────────────
@@ -539,7 +562,7 @@ class SyncStore:
                 msg_id = msg.get("id", 0)
                 if not msg_id:
                     continue
-                self._conn.execute(
+                self._db.execute(
                     """INSERT INTO chat_messages
                        (id, client_uuid, sender_uuid, message, created_at, is_read,
                         raw_json, synced_at)
@@ -559,11 +582,11 @@ class SyncStore:
                     ),
                 )
                 inserted += 1
-            self._conn.commit()
+            self._db.commit()
         return inserted
 
     def get_last_chat_id(self, client_uuid: str) -> int:
-        row = self._conn.execute(
+        row = self._db.execute(
             "SELECT MAX(id) AS max_id FROM chat_messages WHERE client_uuid=?",
             (client_uuid,),
         ).fetchone()
@@ -577,7 +600,7 @@ class SyncStore:
             return False
         tags = program.get("tags", [])
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """INSERT INTO workout_programs
                    (uuid, title, short_desc, long_desc, days, tags, updated_at, raw_json, synced_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -600,7 +623,7 @@ class SyncStore:
             )
             for att in _extract_attachments(program):
                 self._upsert_attachment(uuid, "workout_program", att)
-            self._conn.commit()
+            self._db.commit()
         return True
 
     def upsert_workout_programs(self, programs: list[dict[str, Any]]) -> int:
@@ -611,7 +634,7 @@ class SyncStore:
                 if not uuid:
                     continue
                 tags = p.get("tags", [])
-                self._conn.execute(
+                self._db.execute(
                     """INSERT INTO workout_programs
                        (uuid, title, short_desc, long_desc, days, tags,
                         updated_at, raw_json, synced_at)
@@ -636,7 +659,7 @@ class SyncStore:
                 for att in _extract_attachments(p):
                     self._upsert_attachment(uuid, "workout_program", att)
                 count += 1
-            self._conn.commit()
+            self._db.commit()
         return count
 
     # ── Exercises ───────────────────────────────────────────────────────
@@ -647,7 +670,7 @@ class SyncStore:
             return False
         tags = exercise.get("tags", [])
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """INSERT INTO exercises
                    (uuid, exercise_name, title, exercise_type, sets, reps,
                     tags, raw_json, synced_at)
@@ -671,7 +694,7 @@ class SyncStore:
             )
             for att in _extract_attachments(exercise):
                 self._upsert_attachment(uuid, "exercise", att)
-            self._conn.commit()
+            self._db.commit()
         return True
 
     def upsert_exercises(self, exercises: list[dict[str, Any]]) -> int:
@@ -682,7 +705,7 @@ class SyncStore:
                 if not uuid:
                     continue
                 tags = e.get("tags", [])
-                self._conn.execute(
+                self._db.execute(
                     """INSERT INTO exercises
                        (uuid, exercise_name, title, exercise_type, sets, reps,
                         tags, raw_json, synced_at)
@@ -707,13 +730,13 @@ class SyncStore:
                 for att in _extract_attachments(e):
                     self._upsert_attachment(uuid, "exercise", att)
                 count += 1
-            self._conn.commit()
+            self._db.commit()
         return count
 
     # ── Attachments ─────────────────────────────────────────────────────
 
     def _upsert_attachment(self, parent_uuid: str, parent_type: str, att: dict[str, str]) -> None:
-        self._conn.execute(
+        self._db.execute(
             """INSERT INTO attachments
                (parent_uuid, parent_type, file_url, file_name, synced_at)
                VALUES (?, ?, ?, ?, ?)
@@ -729,24 +752,24 @@ class SyncStore:
 
     def mark_attachment_downloaded(self, parent_uuid: str, file_url: str, local_path: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """UPDATE attachments SET downloaded=1, local_path=?
                    WHERE parent_uuid=? AND file_url=?""",
                 (local_path, parent_uuid, file_url),
             )
-            self._conn.commit()
+            self._db.commit()
 
     def mark_photo_downloaded(self, checkin_uuid: str, photo_url: str, local_path: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._db.execute(
                 """UPDATE checkin_photos SET downloaded=1, local_path=?
                    WHERE checkin_uuid=? AND photo_url=?""",
                 (local_path, checkin_uuid, photo_url),
             )
-            self._conn.commit()
+            self._db.commit()
 
     def get_pending_photos(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             """SELECT checkin_uuid, client_uuid, photo_url
                FROM checkin_photos WHERE downloaded=0 LIMIT ?""",
             (limit,),
@@ -754,7 +777,7 @@ class SyncStore:
         return [dict(r) for r in rows]
 
     def get_pending_attachments(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             """SELECT parent_uuid, parent_type, file_url, file_name
                FROM attachments WHERE downloaded=0 LIMIT ?""",
             (limit,),
@@ -783,7 +806,7 @@ class SyncStore:
         def _count(table: str) -> int:
             if table not in self._ALLOWED_TABLES:
                 raise ValueError(f"Invalid table name: {table}")
-            row = self._conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+            row = self._db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
             return row["c"] if row else 0
 
         return {
@@ -791,7 +814,7 @@ class SyncStore:
             "clients": _count("clients"),
             "checkins": _count("checkins"),
             "checkin_photos": _count("checkin_photos"),
-            "checkin_photos_downloaded": self._conn.execute(
+            "checkin_photos_downloaded": self._db.execute(
                 "SELECT COUNT(*) AS c FROM checkin_photos WHERE downloaded=1"
             ).fetchone()["c"],
             "progress_metrics": _count("progress_metrics"),
@@ -800,13 +823,13 @@ class SyncStore:
             "workout_programs": _count("workout_programs"),
             "exercises": _count("exercises"),
             "attachments": _count("attachments"),
-            "attachments_downloaded": self._conn.execute(
+            "attachments_downloaded": self._db.execute(
                 "SELECT COUNT(*) AS c FROM attachments WHERE downloaded=1"
             ).fetchone()["c"],
         }
 
     def query_checkins(self, client_uuid: str, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             """SELECT uuid, check_in_number, submitted_at, weight, waist, hips,
                       biceps, thighs, sleep_quality, nutrition_adherence,
                       workout_rating, stress_level, energy_level,
@@ -820,7 +843,7 @@ class SyncStore:
     def query_progress(
         self, client_uuid: str, metric: str, limit: int = 200
     ) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             """SELECT metric, value, recorded_at
                FROM progress_metrics
                WHERE client_uuid=? AND metric=?
@@ -830,7 +853,7 @@ class SyncStore:
         return [dict(r) for r in rows]
 
     def query_chat(self, client_uuid: str, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._db.execute(
             """SELECT id, sender_uuid, message, created_at, is_read
                FROM chat_messages WHERE client_uuid=?
                ORDER BY created_at DESC LIMIT ?""",
