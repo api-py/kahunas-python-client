@@ -92,6 +92,7 @@ class PersonaConfig:
     step_minimum: int = 5000
 
     def __post_init__(self) -> None:
+        """Fall back to the built-in template when none was supplied."""
         if not self.template:
             self.template = DEFAULT_PERSONA_TEMPLATE
 

@@ -236,6 +236,13 @@ class SyncStore:
     """Local SQLite mirror of all Kahunas coaching data with delta sync."""
 
     def __init__(self, db_path: str | None = None) -> None:
+        """Open the local mirror, creating the database and schema if needed.
+
+        Args:
+            db_path: Database location. Defaults to ``KAHUNAS_SYNC_DB``, then
+                to ``~/.kahunas/sync.db``. The file is restricted to the
+                owning user because it holds client health data.
+        """
         resolved = db_path or os.getenv("KAHUNAS_SYNC_DB") or _DEFAULT_DB_PATH
         self._db_path = Path(resolved).expanduser()
         prepare_db_directory(self._db_path)
@@ -253,12 +260,15 @@ class SyncStore:
         restrict_db_permissions(self._db_path)
 
     def __enter__(self) -> SyncStore:
+        """Enter a context that closes the connection on exit."""
         return self
 
     def __exit__(self, *args: Any) -> None:
+        """Close the database connection."""
         self.close()
 
     def _init_schema(self) -> None:
+        """Create every table and index the mirror needs, if absent."""
         for statement in _SCHEMA_SQL.split(";"):
             stmt = statement.strip()
             if stmt:
@@ -292,6 +302,11 @@ class SyncStore:
     # ── Sync state ──────────────────────────────────────────────────────
 
     def get_sync_state(self, client_uuid: str, data_type: str) -> dict[str, Any] | None:
+        """Return the recorded sync state for one client and data type.
+
+        Returns:
+            The state row, or ``None`` when this pairing has never synced.
+        """
         row = self._db.execute(
             "SELECT * FROM sync_state WHERE client_uuid=? AND data_type=?",
             (client_uuid, data_type),
@@ -305,6 +320,14 @@ class SyncStore:
         record_count: int = 0,
         last_id: str = "",
     ) -> None:
+        """Record the outcome of a sync pass for one client and data type.
+
+        Args:
+            client_uuid: Client the pass covered.
+            data_type: Collection that was synced, such as ``checkins``.
+            record_count: Number of records held after the pass.
+            last_id: Highest identifier seen, used as the delta cursor.
+        """
         with self._lock:
             self._db.execute(
                 """INSERT INTO sync_state
@@ -321,6 +344,12 @@ class SyncStore:
     # ── Clients ─────────────────────────────────────────────────────────
 
     def upsert_client(self, client: dict[str, Any]) -> bool:
+        """Insert or update one client.
+
+        Returns:
+            ``True`` when the client was stored, ``False`` when the record
+            carried no usable identifier.
+        """
         uuid = client.get("uuid", client.get("id", ""))
         if not uuid:
             return False
@@ -348,6 +377,11 @@ class SyncStore:
         return True
 
     def upsert_clients(self, clients: list[dict[str, Any]]) -> int:
+        """Insert or update many clients in one transaction.
+
+        Returns:
+            The number of clients stored, skipping records with no identifier.
+        """
         count = 0
         with self._lock:
             for c in clients:
@@ -379,6 +413,7 @@ class SyncStore:
         return count
 
     def list_clients(self) -> list[dict[str, Any]]:
+        """Return every mirrored client, ordered as stored."""
         rows = self._db.execute(
             "SELECT uuid, first_name, last_name, email, phone, status, synced_at FROM clients"
         ).fetchall()
@@ -458,6 +493,11 @@ class SyncStore:
         return result
 
     def upsert_checkins(self, client_uuid: str, checkins: list[dict[str, Any]]) -> dict[str, int]:
+        """Insert or update many check-ins for one client.
+
+        Returns:
+            Counts of the check-ins and embedded photos that were stored.
+        """
         inserted = 0
         photos = 0
         with self._lock:
@@ -470,6 +510,7 @@ class SyncStore:
         return {"checkins": inserted, "photos": photos}
 
     def get_client_checkin_count(self, client_uuid: str) -> int:
+        """Return how many check-ins are mirrored for a client."""
         row = self._db.execute(
             "SELECT COUNT(*) AS cnt FROM checkins WHERE client_uuid=?",
             (client_uuid,),
@@ -477,6 +518,7 @@ class SyncStore:
         return row["cnt"] if row else 0
 
     def get_latest_checkin_number(self, client_uuid: str) -> int:
+        """Return the highest check-in number held for a client, or 0 if none."""
         row = self._db.execute(
             "SELECT MAX(check_in_number) AS max_num FROM checkins WHERE client_uuid=?",
             (client_uuid,),
@@ -491,6 +533,11 @@ class SyncStore:
         metric: str,
         data_points: list[dict[str, Any]],
     ) -> int:
+        """Insert or update progress points for one client and metric.
+
+        Returns:
+            The number of points stored.
+        """
         now = _now()
         inserted = 0
         with self._lock:
@@ -515,6 +562,7 @@ class SyncStore:
         return inserted
 
     def get_progress_count(self, client_uuid: str, metric: str) -> int:
+        """Return how many points are held for a client and metric."""
         row = self._db.execute(
             "SELECT COUNT(*) AS cnt FROM progress_metrics WHERE client_uuid=? AND metric=?",
             (client_uuid, metric),
@@ -524,6 +572,11 @@ class SyncStore:
     # ── Habits ──────────────────────────────────────────────────────────
 
     def upsert_habits(self, client_uuid: str, habits: list[dict[str, Any]]) -> int:
+        """Insert or update habit records for one client.
+
+        Returns:
+            The number of habits stored.
+        """
         now = _now()
         inserted = 0
         with self._lock:
@@ -555,6 +608,11 @@ class SyncStore:
     # ── Chat messages ───────────────────────────────────────────────────
 
     def upsert_chat_messages(self, client_uuid: str, messages: list[dict[str, Any]]) -> int:
+        """Insert or update chat messages for one client.
+
+        Returns:
+            The number of messages stored.
+        """
         now = _now()
         inserted = 0
         with self._lock:
@@ -586,6 +644,11 @@ class SyncStore:
         return inserted
 
     def get_last_chat_id(self, client_uuid: str) -> int:
+        """Return the highest chat message id held for a client.
+
+        Used as the delta cursor so a sync fetches only newer messages.
+        Returns 0 when no messages are mirrored.
+        """
         row = self._db.execute(
             "SELECT MAX(id) AS max_id FROM chat_messages WHERE client_uuid=?",
             (client_uuid,),
@@ -595,6 +658,12 @@ class SyncStore:
     # ── Workout programs ────────────────────────────────────────────────
 
     def upsert_workout_program(self, program: dict[str, Any]) -> bool:
+        """Insert or update one workout program and its attachments.
+
+        Returns:
+            ``True`` when the program was stored, ``False`` when it carried
+            no usable identifier.
+        """
         uuid = program.get("uuid", "")
         if not uuid:
             return False
@@ -627,6 +696,11 @@ class SyncStore:
         return True
 
     def upsert_workout_programs(self, programs: list[dict[str, Any]]) -> int:
+        """Insert or update many workout programs in one transaction.
+
+        Returns:
+            The number of programs stored.
+        """
         count = 0
         with self._lock:
             for p in programs:
@@ -665,6 +739,12 @@ class SyncStore:
     # ── Exercises ───────────────────────────────────────────────────────
 
     def upsert_exercise(self, exercise: dict[str, Any]) -> bool:
+        """Insert or update one exercise and its attachments.
+
+        Returns:
+            ``True`` when the exercise was stored, ``False`` when it carried
+            no usable identifier.
+        """
         uuid = exercise.get("uuid", "")
         if not uuid:
             return False
@@ -698,6 +778,11 @@ class SyncStore:
         return True
 
     def upsert_exercises(self, exercises: list[dict[str, Any]]) -> int:
+        """Insert or update many exercises in one transaction.
+
+        Returns:
+            The number of exercises stored.
+        """
         count = 0
         with self._lock:
             for e in exercises:
@@ -736,6 +821,10 @@ class SyncStore:
     # ── Attachments ─────────────────────────────────────────────────────
 
     def _upsert_attachment(self, parent_uuid: str, parent_type: str, att: dict[str, str]) -> None:
+        """Insert one attachment, ignoring a duplicate URL for the same parent.
+
+        Does not commit: the caller owns the transaction and the lock.
+        """
         self._db.execute(
             """INSERT INTO attachments
                (parent_uuid, parent_type, file_url, file_name, synced_at)
@@ -751,6 +840,7 @@ class SyncStore:
         )
 
     def mark_attachment_downloaded(self, parent_uuid: str, file_url: str, local_path: str) -> None:
+        """Record that an attachment has been fetched to ``local_path``."""
         with self._lock:
             self._db.execute(
                 """UPDATE attachments SET downloaded=1, local_path=?
@@ -760,6 +850,7 @@ class SyncStore:
             self._db.commit()
 
     def mark_photo_downloaded(self, checkin_uuid: str, photo_url: str, local_path: str) -> None:
+        """Record that a check-in photo has been fetched to ``local_path``."""
         with self._lock:
             self._db.execute(
                 """UPDATE checkin_photos SET downloaded=1, local_path=?
@@ -769,6 +860,11 @@ class SyncStore:
             self._db.commit()
 
     def get_pending_photos(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return check-in photos that have not been downloaded yet.
+
+        Args:
+            limit: Maximum rows to return.
+        """
         rows = self._db.execute(
             """SELECT checkin_uuid, client_uuid, photo_url
                FROM checkin_photos WHERE downloaded=0 LIMIT ?""",
@@ -777,6 +873,11 @@ class SyncStore:
         return [dict(r) for r in rows]
 
     def get_pending_attachments(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return attachments that have not been downloaded yet.
+
+        Args:
+            limit: Maximum rows to return.
+        """
         rows = self._db.execute(
             """SELECT parent_uuid, parent_type, file_url, file_name
                FROM attachments WHERE downloaded=0 LIMIT ?""",
@@ -804,9 +905,16 @@ class SyncStore:
         """Return counts of all synced data."""
 
         def _count(table: str) -> int:
+            """Count rows in one of the known tables.
+
+            A table name cannot be a bound parameter in SQL, so it is
+            interpolated. Every caller below passes a literal, and the
+            allowlist check makes that structural rather than incidental.
+            """
             if table not in self._ALLOWED_TABLES:
                 raise ValueError(f"Invalid table name: {table}")
-            row = self._db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+
+            row = self._db.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()  # noqa: S608
             return row["c"] if row else 0
 
         return {
@@ -829,6 +937,7 @@ class SyncStore:
         }
 
     def query_checkins(self, client_uuid: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Return a client's most recent check-ins, newest first."""
         rows = self._db.execute(
             """SELECT uuid, check_in_number, submitted_at, weight, waist, hips,
                       biceps, thighs, sleep_quality, nutrition_adherence,
@@ -843,6 +952,7 @@ class SyncStore:
     def query_progress(
         self, client_uuid: str, metric: str, limit: int = 200
     ) -> list[dict[str, Any]]:
+        """Return a client's most recent points for one metric, newest first."""
         rows = self._db.execute(
             """SELECT metric, value, recorded_at
                FROM progress_metrics
@@ -853,6 +963,7 @@ class SyncStore:
         return [dict(r) for r in rows]
 
     def query_chat(self, client_uuid: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return a client's most recent chat messages, newest first."""
         rows = self._db.execute(
             """SELECT id, sender_uuid, message, created_at, is_read
                FROM chat_messages WHERE client_uuid=?

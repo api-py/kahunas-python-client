@@ -238,7 +238,6 @@ def _strip_empty(obj: Any) -> Any:
 
 def create_server(config: KahunasConfig | None = None) -> FastMCP:
     """Create and configure the MCP server with all Kahunas tools."""
-
     mcp = FastMCP(
         "kahunas",
         instructions=(
@@ -2440,8 +2439,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                     progress_total += await asyncio.to_thread(
                         sync.upsert_progress, client_uuid, metric, p_data
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Skipping %s progress for client %s: %s", metric, client_uuid, exc)
         results["progress_points"] = progress_total
 
         # Habits

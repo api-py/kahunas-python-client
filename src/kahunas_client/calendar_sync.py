@@ -45,6 +45,14 @@ class CalendarConfig:
         gym_list: list[str] | None = None,
         default_duration_minutes: int = 60,
     ) -> None:
+        """Store calendar formatting preferences.
+
+        Args:
+            prefix: Text placed before the client name in event titles.
+            default_gym: Location used when an appointment names none.
+            gym_list: Locations the coach works from.
+            default_duration_minutes: Length assumed when no end time is given.
+        """
         self.prefix = prefix
         self.default_gym = default_gym
         self.gym_list = gym_list or []

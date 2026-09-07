@@ -1,7 +1,10 @@
 """Functional tests against the live Kahunas API.
 
 Run with: uv run python tests/functional_test.py
-Requires a valid auth token in /tmp/kahunas_token.txt
+Requires a valid auth token in KAHUNAS_AUTH_TOKEN, or in the file named
+by KAHUNAS_TOKEN_FILE (default: ~/.kahunas/token). A token grants full
+access to the coach's account, so it is never read from a world
+readable location such as /tmp.
 
 NOTE: Web app endpoints (clients, chat, habits, packages, charts) require
 session cookies from the email/password login flow. Token-only auth can
@@ -11,6 +14,8 @@ only access the REST API endpoints at api.kahunas.io/api.
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -21,10 +26,30 @@ from kahunas_client.config import KahunasConfig
 
 
 def load_token() -> str:
-    token_file = Path("/tmp/kahunas_token.txt")
+    """Return the live auth token from the environment or a private file.
+
+    A token grants full access to the coach's account, so it is read from
+    the environment first and otherwise from a path under the user's home.
+    Reading it from a predictable /tmp path exposed it to every other local
+    user and allowed one to pre-place a file there.
+    """
+    token = os.environ.get("KAHUNAS_AUTH_TOKEN", "").strip()
+    if token:
+        return token
+
+    token_file = Path(os.environ.get("KAHUNAS_TOKEN_FILE", "~/.kahunas/token")).expanduser()
     if token_file.exists():
+        mode = stat.S_IMODE(token_file.stat().st_mode)
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            raise PermissionError(
+                f"{token_file} is readable by other users (mode {mode:o}). "
+                f"Run: chmod 600 {token_file}"
+            )
         return token_file.read_text().strip()
-    raise FileNotFoundError("No token file at /tmp/kahunas_token.txt")
+
+    raise FileNotFoundError(
+        f"Set KAHUNAS_AUTH_TOKEN, or place a token in {token_file} with mode 600."
+    )
 
 
 PASS = 0

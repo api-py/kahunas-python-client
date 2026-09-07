@@ -44,6 +44,14 @@ class WhatsAppConfig:
         default_country_code: str = "44",
         api_version: str = "v21.0",
     ) -> None:
+        """Store WhatsApp Business API settings.
+
+        Args:
+            access_token: Meta Cloud API access token.
+            phone_number_id: WhatsApp Business phone number id.
+            default_country_code: Country code applied to national numbers.
+            api_version: Graph API version to call.
+        """
         self.access_token = access_token
         self.phone_number_id = phone_number_id
         self.default_country_code = default_country_code
@@ -51,13 +59,16 @@ class WhatsAppConfig:
 
     @property
     def base_url(self) -> str:
+        """Return the Graph API base URL for the configured version."""
         return f"https://graph.facebook.com/{self.api_version}"
 
     @property
     def messages_url(self) -> str:
+        """Return the endpoint that accepts outbound messages."""
         return f"{self.base_url}/{self.phone_number_id}/messages"
 
     def is_configured(self) -> bool:
+        """Return whether both an access token and a phone number id are set."""
         return bool(self.access_token and self.phone_number_id)
 
 
@@ -134,10 +145,12 @@ class WhatsAppClient:
     """
 
     def __init__(self, config: WhatsAppConfig) -> None:
+        """Build a client for ``config``. Use it as an async context manager."""
         self._config = config
         self._http: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> WhatsAppClient:
+        """Open the HTTP client and attach the bearer token."""
         self._http = httpx.AsyncClient(
             timeout=30.0,
             headers={
@@ -148,11 +161,13 @@ class WhatsAppClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        """Close the HTTP client."""
         if self._http:
             await self._http.aclose()
             self._http = None
 
     def _ensure_http(self) -> httpx.AsyncClient:
+        """Return the open HTTP client, or raise if used outside the context."""
         if not self._http:
             raise RuntimeError("WhatsAppClient not initialized. Use 'async with' context manager.")
         return self._http

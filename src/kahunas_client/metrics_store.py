@@ -111,6 +111,13 @@ class MetricsStore:
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
+        """Prepare the store without opening a connection.
+
+        Args:
+            db_path: Database location. Defaults to ``KAHUNAS_METRICS_DB``,
+                then to ``~/.kahunas/metrics.db``. The file is restricted to
+                the owning user because it holds client measurements.
+        """
         if db_path is None:
             env_path = os.environ.get("KAHUNAS_METRICS_DB", "")
             db_path = Path(env_path) if env_path else _DEFAULT_DB_PATH

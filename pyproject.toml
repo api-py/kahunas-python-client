@@ -71,21 +71,33 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = [
-    "E",    # pycodestyle errors
-    "W",    # pycodestyle warnings
+    "E",    # pycodestyle errors (PEP 8)
+    "W",    # pycodestyle warnings (PEP 8)
     "F",    # pyflakes
-    "I",    # isort
-    "N",    # pep8-naming
-    "UP",   # pyupgrade
+    "I",    # isort (PEP 8 import ordering)
+    "N",    # pep8-naming (PEP 8)
+    "D",    # pydocstyle (PEP 257)
+    "UP",   # pyupgrade (PEP 585, PEP 604)
     "B",    # flake8-bugbear
+    "S",    # flake8-bandit (security)
     "SIM",  # flake8-simplify
     "TCH",  # flake8-type-checking
     "RUF",  # ruff-specific
 ]
 ignore = ["UP046"]  # Generic[T] subclass is needed for Pydantic models
 
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["TCH002", "TCH003"]  # don't require TYPE_CHECKING blocks in tests
+"tests/**" = [
+    "TCH002",
+    "TCH003",  # don't require TYPE_CHECKING blocks in tests
+    "S101",    # assert is how a test states its expectation
+    "S105",
+    "S106",    # obviously fake credentials in fixtures
+    "D",       # test names and class docstrings carry the intent
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["kahunas_client"]

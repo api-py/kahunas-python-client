@@ -51,7 +51,7 @@ _WINDOWS_RESERVED = frozenset(
 
 
 def safe_filename(name: str, fallback: str = "unnamed") -> str:
-    """Reduce an untrusted string to one inert filename segment.
+    r"""Reduce an untrusted string to one inert filename segment.
 
     Strips any directory component, removes separators, control characters
     and filesystem metacharacters, and refuses names that would resolve to

@@ -107,7 +107,7 @@ class TestServeDefaults:
         runner = CliRunner()
         result = runner.invoke(cli, ["serve", "--help"])
         assert result.exit_code == 0
-        assert "0.0.0.0" not in result.output
+        assert "0.0.0.0" not in result.output  # noqa: S104 - asserting the default is not this
 
     def test_transport_choices_come_from_the_shared_literal_set(self) -> None:
         runner = CliRunner()

@@ -56,12 +56,18 @@ class KahunasClient:
     """
 
     def __init__(self, config: KahunasConfig | None = None) -> None:
+        """Build a client from ``config``, or from the environment when omitted.
+
+        No connection is opened here. Use the object as an async context
+        manager, which creates the HTTP clients and authenticates.
+        """
         self._config = config or KahunasConfig.from_env()
         self._session: AuthSession | None = None
         self._http: httpx.AsyncClient | None = None
         self._web_http: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> KahunasClient:
+        """Open the HTTP clients and authenticate if credentials are available."""
         self._http = httpx.AsyncClient(
             base_url=self._config.api_base_url,
             timeout=self._config.timeout,
@@ -79,6 +85,7 @@ class KahunasClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        """Close both HTTP clients."""
         if self._http:
             await self._http.aclose()
             self._http = None
@@ -88,6 +95,7 @@ class KahunasClient:
 
     @property
     def is_authenticated(self) -> bool:
+        """Return whether a session with a non empty auth token is held."""
         return self._session is not None and bool(self._session.auth_token)
 
     async def authenticate(self) -> AuthSession:
@@ -182,6 +190,7 @@ class KahunasClient:
         return self._session
 
     def _api_headers(self) -> dict[str, str]:
+        """Return the REST API auth headers, or raise if not authenticated."""
         if not self._session:
             raise AuthenticationError("Not authenticated. Call authenticate() first.")
         return {"Auth-User-Token": self._session.auth_token}

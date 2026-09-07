@@ -68,7 +68,7 @@ def _cell(ws: Worksheet, *, row: int, column: int, value: Any = None) -> Cell:
 
 
 def _sheet_title(name: str, fallback: str = "Sheet") -> str:
-    """Return a worksheet title Excel will accept.
+    r"""Return a worksheet title Excel will accept.
 
     Excel additionally rejects ``[ ] : * ? / \\`` in a title and caps the
     length at 31 characters, so this is stricter than a filename.
@@ -124,9 +124,10 @@ def _auto_width(ws: Any) -> None:
         for cell in col:
             try:
                 val = str(cell.value or "")
-                max_len = max(max_len, min(len(val), 60))
             except Exception:
-                pass
+                logger.debug("Could not measure cell %s for column width", cell.coordinate)
+                continue
+            max_len = max(max_len, min(len(val), 60))
         ws.column_dimensions[col_letter].width = max(max_len + 2, 12)
 
 
@@ -134,6 +135,7 @@ class ExportManager:
     """Exports Kahunas data to user-friendly Excel files."""
 
     def __init__(self, client: KahunasClient) -> None:
+        """Build an exporter that reads through ``client``."""
         self._client = client
 
     def _base_dir(self, output_dir: str | None) -> Path:

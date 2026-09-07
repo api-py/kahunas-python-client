@@ -1,4 +1,4 @@
-"""Entry point for running the MCP server: python -m kahunas_client.mcp
+"""Entry point for running the MCP server via python -m kahunas_client.mcp.
 
 Transport modes:
     stdio (default)  — single-session, used by Claude Desktop / IDE integrations
