@@ -50,6 +50,29 @@ packages = ["src/kahunas_client"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# functional_test.py talks to the live Kahunas API and is run by hand.
+addopts = "--ignore=tests/functional_test.py"
+filterwarnings = [
+    # mangum calls asyncio.get_event_loop() at import; nothing we control.
+    "ignore:There is no current event loop:DeprecationWarning:mangum.adapter",
+]
+
+[tool.coverage.run]
+source = ["src/kahunas_client"]
+branch = true
+
+[tool.coverage.report]
+# Raised from the 62% that stood before this branch, with a little head
+# room below the current figure so an unrelated change does not fail the
+# build. Lower it only with a stated reason: it exists to stop coverage
+# sliding back.
+fail_under = 73
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
 
 [tool.mypy]
 python_version = "3.12"

@@ -8,6 +8,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -192,6 +193,36 @@ def _get_sync() -> SyncStore:
         store = SyncStore()
         _sync_var.set(store)
     return store
+
+
+def _web_payload(resp: httpx.Response, tool: str) -> str:
+    """Return a web app response body as JSON text, or a structured error.
+
+    The Kahunas web app answers an expired session with a full HTML login
+    page under HTTP 200. Returning that body verbatim handed the model a
+    document of markup with no indication that the call had failed, and no
+    way to tell an empty result from a lost session. A non JSON body now
+    becomes a short error naming the tool and the likely cause.
+
+    A JSON body is passed through unchanged, so successful payloads keep
+    exactly the shape callers already receive.
+    """
+    text = resp.text
+    try:
+        json.loads(text)
+    except ValueError:
+        snippet = re.sub(r"\s+", " ", text).strip()[:200]
+        logger.warning("%s received a non JSON response (status %s)", tool, resp.status_code)
+        return _compact(
+            {
+                "error": (
+                    f"{tool} did not return JSON (HTTP {resp.status_code}). "
+                    "The session may have expired; call login() again."
+                ),
+                "snippet": snippet,
+            }
+        )
+    return text
 
 
 def _compact(data: Any) -> str:
@@ -445,7 +476,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def list_clients() -> str:
         """List all coaching clients."""
         resp = await _get_client().list_clients()
-        return resp.text
+        return _web_payload(resp, "list_clients")
 
     @mcp.tool()
     async def create_client(
@@ -466,13 +497,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         if package_uuid:
             data["package_uuid"] = package_uuid
         resp = await _get_client().create_client(data)
-        return resp.text
+        return _web_payload(resp, "create_client")
 
     @mcp.tool()
     async def get_client(client_uuid: str, action: str = "view") -> str:
         """Get client details. Actions: view, edit, delete, suspend, activate."""
         resp = await _get_client().get_client_action(action, client_uuid)
-        return resp.text
+        return _web_payload(resp, "get_client")
 
     # ── Diet & Supplements ──
 
@@ -480,13 +511,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def manage_diet_plan(action: str, plan_id: str = "") -> str:
         """Manage diet plans. Actions: list, view, create, update, delete."""
         resp = await _get_client().diet_plan_action(action, plan_id)
-        return resp.text
+        return _web_payload(resp, "manage_diet_plan")
 
     @mcp.tool()
     async def manage_supplement_plan(action: str, plan_id: str = "") -> str:
         """Manage supplement plans. Actions: list, view, create, update, delete."""
         resp = await _get_client().supplement_plan_action(action, plan_id)
-        return resp.text
+        return _web_payload(resp, "manage_supplement_plan")
 
     # ── Check-ins ──
 
@@ -494,19 +525,19 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def view_checkin(checkin_uuid: str) -> str:
         """View a client check-in with all submitted data."""
         resp = await _get_client().get_checkin(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "view_checkin")
 
     @mcp.tool()
     async def delete_checkin(checkin_uuid: str) -> str:
         """Delete a client check-in."""
         resp = await _get_client().delete_checkin(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "delete_checkin")
 
     @mcp.tool()
     async def compare_checkins(checkin_uuid: str) -> str:
         """Compare check-in data over time."""
         resp = await _get_client().compare_checkins(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "compare_checkins")
 
     @mcp.tool()
     async def checkin_summary(client_uuid: str, client_name: str = "") -> str:
@@ -561,19 +592,19 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def create_habit(client_uuid: str, title: str) -> str:
         """Create a new habit for a client."""
         resp = await _get_client().create_habit({"client": client_uuid, "title": title})
-        return resp.text
+        return _web_payload(resp, "create_habit")
 
     @mcp.tool()
     async def complete_habit(habit_uuid: str) -> str:
         """Mark a habit as completed."""
         resp = await _get_client().complete_habit({"uuid": habit_uuid})
-        return resp.text
+        return _web_payload(resp, "complete_habit")
 
     @mcp.tool()
     async def list_habits(client_uuid: str, date: str = "") -> str:
         """List habits for a client on a given date."""
         resp = await _get_client().list_habits(client_uuid, date)
-        return resp.text
+        return _web_payload(resp, "list_habits")
 
     # ── Chat ──
 
@@ -581,13 +612,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def list_chat_contacts(keyword: str = "") -> str:
         """List clients available for chat, optionally filtered by keyword."""
         resp = await _get_client().get_chat_clients(keyword)
-        return resp.text
+        return _web_payload(resp, "list_chat_contacts")
 
     @mcp.tool()
     async def get_chat_messages(client_uuid: str, last_id: int = 0) -> str:
         """Get chat messages with a client. Use last_id for pagination."""
         resp = await _get_client().get_chat_messages(client_uuid, last_id)
-        return resp.text
+        return _web_payload(resp, "get_chat_messages")
 
     @mcp.tool()
     async def send_chat_message(receiver_uuid: str, message: str) -> str:
@@ -595,7 +626,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         resp = await _get_client().send_chat_message(
             {"receiver_uuid": receiver_uuid, "message": message}
         )
-        return resp.text
+        return _web_payload(resp, "send_chat_message")
 
     # ── Packages ──
 
@@ -603,7 +634,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def manage_package(action: str, package_id: str = "") -> str:
         """Manage coaching packages. Actions: list, view, create, update, delete."""
         resp = await _get_client().package_action(action, package_id)
-        return resp.text
+        return _web_payload(resp, "manage_package")
 
     # ── Calendar ──
 
@@ -611,7 +642,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def delete_calendar_event(event_id: str) -> str:
         """Delete a calendar event."""
         resp = await _get_client().delete_calendar_event(event_id)
-        return resp.text
+        return _web_payload(resp, "delete_calendar_event")
 
     # ── Configuration ──
 
@@ -619,7 +650,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def update_coach_settings(section: str, settings: dict[str, Any]) -> str:
         """Update coach configuration settings for a section."""
         resp = await _get_client().update_configuration(section, settings)
-        return resp.text
+        return _web_payload(resp, "update_coach_settings")
 
     # ── Progress & Charts ──
 
@@ -636,7 +667,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         Range types: week, month, quarter, year, all.
         """
         resp = await _get_client().get_chart_data(client_uuid, metric, range_type, date_range)
-        return resp.text
+        return _web_payload(resp, "get_client_progress")
 
     @mcp.tool()
     async def get_exercise_progress(
@@ -649,7 +680,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         resp = await _get_client().get_chart_by_exercise(
             exercise_name, client_uuid, chart_type, filter_val
         )
-        return resp.text
+        return _web_payload(resp, "get_exercise_progress")
 
     @mcp.tool()
     async def generate_progress_chart(
@@ -720,7 +751,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     ) -> str:
         """Get the workout log book for an exercise and client."""
         resp = await _get_client().get_workout_log(exercise_id, client_uuid, filter_val)
-        return resp.text
+        return _web_payload(resp, "get_workout_log")
 
     # ── Notifications ──
 
@@ -728,7 +759,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def notify_client(client_uuid: str, action: str) -> str:
         """Send a notification to a client."""
         resp = await _get_client().notify_client(action, client_uuid)
-        return resp.text
+        return _web_payload(resp, "notify_client")
 
     # ── WhatsApp Messaging ──
 
