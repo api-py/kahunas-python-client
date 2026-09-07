@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Action versions are referenced by tag here. Dependabot pins and updates
+  # them, which is how the SHA pinning that hardened workflows want is kept
+  # current without hand editing every reference.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      dev-dependencies:
+        dependency-type: development

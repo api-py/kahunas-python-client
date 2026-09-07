@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+# The workflow only reads the repository. Nothing here publishes, comments,
+# or writes back, so no other scope is granted.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-flight run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Charts render headlessly on the runner.
+  MPLBACKEND: Agg
+  FORCE_COLOR: "1"
+
+jobs:
+  quality:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the locked environment
+        # --locked fails if uv.lock has drifted from pyproject.toml, so a
+        # dependency change cannot land without its lockfile update.
+        run: uv sync --all-extras --locked
+
+      - name: Ruff lint (PEP 8, PEP 257, bandit)
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: mypy strict
+        run: uv run mypy src
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the locked environment
+        run: uv sync --all-extras --locked --python ${{ matrix.python-version }}
+
+      - name: Run the test suite
+        # The coverage floor lives in pyproject.toml so a local run enforces
+        # exactly what CI does.
+        run: uv run --python ${{ matrix.python-version }} pytest --cov --cov-report=term --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Export the locked runtime dependencies
+        run: uv export --format requirements-txt --no-emit-project --no-dev --output-file requirements.lock.txt
+
+      - name: Audit for known vulnerabilities
+        # Audits the versions that actually ship, not the loosest versions
+        # the constraints in pyproject.toml would allow.
+        run: uv run --with pip-audit pip-audit --requirement requirements.lock.txt --disable-pip
+
+  build:
+    name: Build and verify the distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build the wheel and sdist (PEP 517)
+        run: uv build
+
+      - name: Check the distribution metadata (PEP 621, PEP 440)
+        run: uv run --with twine twine check dist/*
+
+      - name: Confirm the wheel imports and the entry points resolve
+        run: |
+          uv run --isolated --no-project --with dist/*.whl python -c "
+          import kahunas_client
+          from kahunas_client.cli.main import cli
+          from kahunas_client.mcp.__main__ import main
+          print('package version:', kahunas_client.__version__)
+          "
+
+      - name: Upload the distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

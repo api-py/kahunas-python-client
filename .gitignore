@@ -62,3 +62,6 @@ captured_traffic/
 /tmp/
 *.tmp
 .creds.txt
+# Build artefacts from a local `uv build`
+requirements.lock.txt
+coverage.xml
