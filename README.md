@@ -9,7 +9,7 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 ## Features
 
 - **Python Client** — Async HTTP client (`httpx`) with Pydantic v2 models, automatic token refresh, retry logic, and connection resilience
-- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io/) server with **75 tools**, compact JSON payloads, and support for **stdio**, **HTTP/SSE**, and **streamable-http** transports (session-isolated via `contextvars`)
+- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io/) server on **FastMCP 4** with **75 tools**, compact JSON payloads, and support for **stdio**, **HTTP/SSE**, and **streamable-http** transports (session-isolated via `contextvars`)
 - **CLI** — Command-line interface with rich terminal output for managing clients, workouts, exercises, and exports
 - **Charts** — Generate PNG progress charts (body weight, body fat, steps, measurements) using `matplotlib`
 - **Calendar Sync** — Sync Kahunas appointments with Google Calendar or Apple Calendar (iCal), with preview/add/remove/sync/trust modes for LLM-driven orchestration
@@ -781,7 +781,7 @@ src/kahunas_client/
 │   ├── common.py         # Pagination, ApiResponse, MediaItem
 │   ├── exercises.py      # Exercise, ExerciseListData
 │   └── workouts.py       # WorkoutProgram, WorkoutDay, ExerciseSet
-├── mcp/                  # MCP server (FastMCP 3.x, stdio + HTTP/SSE)
+├── mcp/                  # MCP server (FastMCP 4.x, stdio + HTTP/SSE)
 │   ├── server.py         # 75 tool definitions (compact JSON, contextvars isolation)
 │   ├── export.py         # Excel export manager (async I/O)
 │   ├── lambda_handler.py # AWS Lambda handler (Mangum)
