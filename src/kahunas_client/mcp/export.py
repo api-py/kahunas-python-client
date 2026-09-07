@@ -15,8 +15,11 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
 from ..jsonutil import as_dict, as_str, first_list
+from ..safepath import safe_filename
 
 if TYPE_CHECKING:
+    from openpyxl.cell.cell import Cell
+
     from ..client import KahunasClient
 
 logger = logging.getLogger(__name__)
@@ -27,9 +30,56 @@ _HEADER_FONT_WHITE = Font(bold=True, size=11, color="FFFFFF")
 _WRAP = Alignment(wrap_text=True, vertical="top")
 
 
-def _sanitize_name(name: str) -> str:
-    """Make a filesystem-safe name."""
-    return re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(".")
+# Leading characters that make a spreadsheet evaluate a cell as a formula.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+# Characters Excel rejects in a worksheet title, beyond the general set.
+_SHEET_TITLE_UNSAFE = re.compile(r"[\[\]:*?/\\]")
+_MAX_SHEET_TITLE = 31
+
+
+def _neutralise_formula(value: Any) -> Any:
+    """Prefix a leading formula trigger so spreadsheets treat the cell as text.
+
+    Exported values include client names, check-in notes and chat messages,
+    all of which are supplied by people outside the coach's control. A value
+    beginning with ``=``, ``+``, ``-`` or ``@`` is evaluated as a formula by
+    Excel, LibreOffice and Google Sheets when the file is opened, which is
+    the spreadsheet injection class: a crafted note can invoke external data
+    connections or shell commands on the coach's machine.
+
+    Prefixing a single quote is the standard mitigation. Spreadsheets store
+    the value as literal text and do not display the quote. Non string values
+    are returned unchanged, so genuine numbers stay numeric.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+        return f"'{value}"
+    return value
+
+
+def _cell(ws: Worksheet, *, row: int, column: int, value: Any = None) -> Cell:
+    """Write ``value`` into a worksheet cell with formula injection neutralised.
+
+    Every write in this module goes through here so the mitigation cannot be
+    forgotten when a new column is added.
+    """
+    written: Cell = ws.cell(row=row, column=column, value=_neutralise_formula(value))
+    return written
+
+
+def _sheet_title(name: str, fallback: str = "Sheet") -> str:
+    """Return a worksheet title Excel will accept.
+
+    Excel additionally rejects ``[ ] : * ? / \\`` in a title and caps the
+    length at 31 characters, so this is stricter than a filename.
+    """
+    cleaned = _SHEET_TITLE_UNSAFE.sub("_", name).strip().strip("'").strip()
+    cleaned = cleaned[:_MAX_SHEET_TITLE].strip()
+    # A title made only of the replacement character carries no meaning, so
+    # treat it as empty and use the caller's fallback instead.
+    if not cleaned or set(cleaned) <= {"_"}:
+        return fallback
+    return cleaned
 
 
 def _timestamp() -> str:
@@ -60,7 +110,7 @@ def _drop_default_sheet(wb: Workbook) -> None:
 def _add_header_row(ws: Any, headers: list[str]) -> None:
     """Add a styled header row to a worksheet."""
     for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=header)
+        cell = _cell(ws, row=1, column=col, value=header)
         cell.font = _HEADER_FONT_WHITE
         cell.fill = _HEADER_FILL
         cell.alignment = Alignment(horizontal="center")
@@ -109,7 +159,7 @@ class ExportManager:
 
         client_name = self._extract_client_name(client_data, client_uuid)
         base = self._base_dir(output_dir)
-        client_dir = base / _sanitize_name(client_name)
+        client_dir = base / safe_filename(client_name, fallback=client_uuid)
         client_dir.mkdir(parents=True, exist_ok=True)
 
         # Profile (blocking I/O — run in thread pool)
@@ -149,7 +199,7 @@ class ExportManager:
             wb = Workbook()
             ws = _titled_sheet(wb, "Clients")
             _add_header_row(ws, ["Status"])
-            ws.cell(row=2, column=1, value="No clients found")
+            _cell(ws, row=2, column=1, value="No clients found")
             await asyncio.to_thread(wb.save, base / "clients_summary.xlsx")
             return base
 
@@ -192,17 +242,19 @@ class ExportManager:
         while True:
             data = await self._client.list_exercises(page=page, per_page=100)
             for ex in data.exercises:
-                ws.cell(row=row, column=1, value=ex.exercise_name or ex.title)
-                ws.cell(row=row, column=2, value="Strength" if ex.exercise_type == 1 else "Cardio")
-                ws.cell(row=row, column=3, value=ex.sets)
-                ws.cell(row=row, column=4, value=ex.reps)
-                ws.cell(row=row, column=5, value=ex.rir)
-                ws.cell(row=row, column=6, value=ex.rpe_rating)
-                ws.cell(row=row, column=7, value=ex.intensity)
-                ws.cell(row=row, column=8, value=ex.rest_period)
-                ws.cell(row=row, column=9, value=ex.tempo)
-                ws.cell(row=row, column=10, value=ex.notes)
-                ws.cell(row=row, column=11, value=", ".join(ex.tags))
+                _cell(ws, row=row, column=1, value=ex.exercise_name or ex.title)
+                _cell(
+                    ws, row=row, column=2, value="Strength" if ex.exercise_type == 1 else "Cardio"
+                )
+                _cell(ws, row=row, column=3, value=ex.sets)
+                _cell(ws, row=row, column=4, value=ex.reps)
+                _cell(ws, row=row, column=5, value=ex.rir)
+                _cell(ws, row=row, column=6, value=ex.rpe_rating)
+                _cell(ws, row=row, column=7, value=ex.intensity)
+                _cell(ws, row=row, column=8, value=ex.rest_period)
+                _cell(ws, row=row, column=9, value=ex.tempo)
+                _cell(ws, row=row, column=10, value=ex.notes)
+                _cell(ws, row=row, column=11, value=", ".join(ex.tags))
                 row += 1
 
             if not data.pagination.next_page:
@@ -239,7 +291,7 @@ class ExportManager:
 
     def _export_single_program(self, programs_dir: Path, program: Any) -> None:
         """Export a single workout program to an Excel file."""
-        name = _sanitize_name(program.title or program.uuid)
+        name = safe_filename(program.title or program.uuid)
         filepath = programs_dir / f"{name}.xlsx"
 
         wb = Workbook()
@@ -249,17 +301,17 @@ class ExportManager:
         if not program.workout_days:
             ws = wb.create_sheet("Overview")
             _add_header_row(ws, ["Program", "Description"])
-            ws.cell(row=2, column=1, value=program.title)
-            ws.cell(row=2, column=2, value=program.long_desc or program.short_desc)
+            _cell(ws, row=2, column=1, value=program.title)
+            _cell(ws, row=2, column=2, value=program.long_desc or program.short_desc)
             wb.save(filepath)
             return
 
         for day in program.workout_days:
-            sheet_name = _sanitize_name(day.title or "Rest Day")[:31]
+            sheet_name = _sheet_title(day.title or "Rest Day", fallback="Rest Day")
             ws = wb.create_sheet(sheet_name)
 
             if day.is_restday:
-                ws.cell(row=1, column=1, value="Rest Day")
+                _cell(ws, row=1, column=1, value="Rest Day")
                 ws["A1"].font = _HEADER_FONT
                 continue
 
@@ -281,23 +333,23 @@ class ExportManager:
             for section_name in ("warmup", "workout", "cooldown"):
                 groups = getattr(day.exercise_list, section_name, [])
                 if groups:
-                    ws.cell(row=row, column=1, value=f"── {section_name.upper()} ──")
-                    ws.cell(row=row, column=1).font = Font(bold=True, italic=True)
+                    _cell(ws, row=row, column=1, value=f"── {section_name.upper()} ──")
+                    _cell(ws, row=row, column=1).font = Font(bold=True, italic=True)
                     row += 1
 
                 for group in groups:
                     group_type = group.type if group.type != "normal" else ""
                     for exercise in group.exercises:
-                        ws.cell(row=row, column=1, value=exercise.exercise_name)
-                        ws.cell(row=row, column=2, value=group_type)
-                        ws.cell(row=row, column=3, value=exercise.sets)
-                        ws.cell(row=row, column=4, value=exercise.reps)
-                        ws.cell(row=row, column=5, value="")
-                        ws.cell(row=row, column=6, value=exercise.rir)
-                        ws.cell(row=row, column=7, value=exercise.rpe_rating)
-                        ws.cell(row=row, column=8, value=exercise.tempo)
-                        ws.cell(row=row, column=9, value=exercise.rest_period)
-                        ws.cell(row=row, column=10, value=exercise.notes or "")
+                        _cell(ws, row=row, column=1, value=exercise.exercise_name)
+                        _cell(ws, row=row, column=2, value=group_type)
+                        _cell(ws, row=row, column=3, value=exercise.sets)
+                        _cell(ws, row=row, column=4, value=exercise.reps)
+                        _cell(ws, row=row, column=5, value="")
+                        _cell(ws, row=row, column=6, value=exercise.rir)
+                        _cell(ws, row=row, column=7, value=exercise.rpe_rating)
+                        _cell(ws, row=row, column=8, value=exercise.tempo)
+                        _cell(ws, row=row, column=9, value=exercise.rest_period)
+                        _cell(ws, row=row, column=10, value=exercise.notes or "")
                         row += 1
 
             _auto_width(ws)
@@ -311,7 +363,7 @@ class ExportManager:
 
         # Row 1: header
         for col, header in enumerate(["Field", "Value"], 1):
-            cell = ws.cell(row=1, column=col, value=header)
+            cell = _cell(ws, row=1, column=col, value=header)
             cell.font = _HEADER_FONT_WHITE
             cell.fill = _HEADER_FILL
 
@@ -324,8 +376,8 @@ class ExportManager:
                     if isinstance(val, (str, int, float, bool)):
                         # Human-readable field names
                         label = key.replace("_", " ").title()
-                        ws.cell(row=row, column=1, value=label)
-                        ws.cell(row=row, column=2, value=str(val))
+                        _cell(ws, row=row, column=1, value=label)
+                        _cell(ws, row=row, column=2, value=str(val))
                         row += 1
 
         _auto_width(ws)
@@ -353,10 +405,10 @@ class ExportManager:
 
         for i, ci in enumerate(checkins, 1):
             row = i + 1
-            ws.cell(row=row, column=1, value=ci.get("check_in_number", i))
-            ws.cell(row=row, column=2, value=ci.get("submitted_at", ci.get("date", "")))
-            ws.cell(row=row, column=3, value=ci.get("uuid", ""))
-            ws.cell(row=row, column=4, value=ci.get("status", "submitted"))
+            _cell(ws, row=row, column=1, value=ci.get("check_in_number", i))
+            _cell(ws, row=row, column=2, value=ci.get("submitted_at", ci.get("date", "")))
+            _cell(ws, row=row, column=3, value=ci.get("uuid", ""))
+            _cell(ws, row=row, column=4, value=ci.get("status", "submitted"))
 
             # Download photos if requested
             if include_photos:
@@ -392,10 +444,10 @@ class ExportManager:
                 if isinstance(chart_data, list):
                     for i, point in enumerate(chart_data, 2):
                         if isinstance(point, dict):
-                            ws.cell(
-                                row=i, column=1, value=point.get("date", point.get("label", ""))
+                            _cell(
+                                ws, row=i, column=1, value=point.get("date", point.get("label", ""))
                             )
-                            ws.cell(row=i, column=2, value=point.get("value", point.get("y", "")))
+                            _cell(ws, row=i, column=2, value=point.get("value", point.get("y", "")))
 
                 _auto_width(ws)
             except Exception as e:
@@ -422,10 +474,10 @@ class ExportManager:
         _add_header_row(ws, ["Habit", "Date", "Completed", "UUID"])
 
         for i, habit in enumerate(habits, 2):
-            ws.cell(row=i, column=1, value=habit.get("title", ""))
-            ws.cell(row=i, column=2, value=habit.get("date", ""))
-            ws.cell(row=i, column=3, value="Yes" if habit.get("completed") else "No")
-            ws.cell(row=i, column=4, value=habit.get("uuid", ""))
+            _cell(ws, row=i, column=1, value=habit.get("title", ""))
+            _cell(ws, row=i, column=2, value=habit.get("date", ""))
+            _cell(ws, row=i, column=3, value="Yes" if habit.get("completed") else "No")
+            _cell(ws, row=i, column=4, value=habit.get("uuid", ""))
 
         _auto_width(ws)
         await asyncio.to_thread(wb.save, habits_dir / "habit_tracking.xlsx")
@@ -448,12 +500,12 @@ class ExportManager:
         _add_header_row(ws, ["Date", "From", "Message", "Read"])
 
         for i, msg in enumerate(messages, 2):
-            ws.cell(row=i, column=1, value=msg.get("created_at", ""))
+            _cell(ws, row=i, column=1, value=msg.get("created_at", ""))
             sender = msg.get("sender_name", msg.get("sender_uuid", ""))
-            ws.cell(row=i, column=2, value=sender)
-            ws.cell(row=i, column=3, value=msg.get("message", ""))
-            ws.cell(row=i, column=3).alignment = _WRAP
-            ws.cell(row=i, column=4, value="Yes" if msg.get("read") else "No")
+            _cell(ws, row=i, column=2, value=sender)
+            _cell(ws, row=i, column=3, value=msg.get("message", ""))
+            _cell(ws, row=i, column=3).alignment = _WRAP
+            _cell(ws, row=i, column=4, value="Yes" if msg.get("read") else "No")
 
         _auto_width(ws)
         await asyncio.to_thread(wb.save, chat_dir / "chat_history.xlsx")

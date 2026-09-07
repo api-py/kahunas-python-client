@@ -8,9 +8,12 @@ import contextvars
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 from fastmcp import FastMCP
 
 from ..anomaly_detection import parse_thresholds, scan_client_anomalies
@@ -34,9 +37,106 @@ from ..pdf_export import (
 )
 from ..persona import PersonaConfig, build_anomaly_warning, get_persona_summary
 from ..phone_alignment import build_phone_alignment_report
+from ..safepath import safe_filename, safe_join
 from .export import ExportManager
 
 logger = logging.getLogger(__name__)
+
+# Media download policy. URLs and filenames in the sync database come from
+# the Kahunas API, so both are treated as untrusted input.
+_ALLOWED_MEDIA_SCHEMES = frozenset({"http", "https"})
+_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+_MEDIA_EXTENSIONS = {
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+}
+
+
+def _is_downloadable_url(url: str) -> bool:
+    """Return whether ``url`` is an absolute HTTP(S) URL with a host.
+
+    Rejects ``file://`` and other schemes that would make the download
+    tool read local or internal resources on behalf of a caller.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in _ALLOWED_MEDIA_SCHEMES and bool(parsed.netloc)
+
+
+async def _download_bounded(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+    """Stream ``url`` into memory, stopping past the size cap.
+
+    Args:
+        http: Client to fetch with.
+        url: Untrusted media URL from the sync database.
+
+    Returns:
+        A ``(body, content_type)`` pair, or ``None`` when the URL is not
+        fetchable, the response is not a success, or the payload exceeds
+        :data:`_MAX_MEDIA_BYTES`. Streaming means an oversized response is
+        abandoned mid transfer rather than being buffered in full first.
+    """
+    if not _is_downloadable_url(url):
+        logger.warning("Refusing to download from unsupported URL: %.100s", url)
+        return None
+
+    async with http.stream("GET", url) as resp:
+        if resp.status_code != 200:
+            logger.warning("Download failed with status %s: %.100s", resp.status_code, url)
+            return None
+
+        declared = resp.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > _MAX_MEDIA_BYTES:
+            logger.warning("Skipping %.100s: declared size %s exceeds cap", url, declared)
+            return None
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > _MAX_MEDIA_BYTES:
+                logger.warning("Skipping %.100s: body exceeded %d bytes", url, _MAX_MEDIA_BYTES)
+                return None
+            chunks.append(chunk)
+
+        return b"".join(chunks), resp.headers.get("content-type", "")
+
+
+def _default_output_dir() -> Path:
+    """Return the private directory used when a caller names no output path.
+
+    Generated charts and calendar files carry client names and health data.
+    The previous default wrote them to fixed ``/tmp/kahunas_*`` paths, which
+    on a shared host are world readable and can be pre-created as symlinks
+    pointing somewhere else. This directory is owned by the running user and
+    created with owner only permissions.
+    """
+    output_dir = Path(os.getenv("KAHUNAS_OUTPUT_DIR", "~/.kahunas/output")).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return output_dir
+
+
+def _default_output_path(*name_parts: str, suffix: str) -> str:
+    """Build a private output path from sanitised ``name_parts``.
+
+    A random component keeps two concurrent calls for the same client from
+    overwriting one another, and stops the filename being guessable by
+    another local user.
+    """
+    stem = "_".join(safe_filename(part) for part in name_parts if part) or "kahunas"
+    unique = secrets.token_hex(4)
+    return str(_default_output_dir() / f"{safe_filename(stem)}_{unique}{suffix}")
+
+
+def _media_extension(content_type: str, default: str = ".jpg") -> str:
+    """Map a response content type to a file extension."""
+    base = content_type.split(";", 1)[0].strip().lower()
+    return _MEDIA_EXTENSIONS.get(base, default)
+
 
 # Session-isolated state using contextvars so each HTTP session gets its own
 # KahunasClient, ExportManager, and MetricsStore instance.  For stdio
@@ -550,8 +650,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         # Determine output path
         if not output_path:
-            safe_name = client_name.replace(" ", "_") or client_uuid[:8]
-            output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
+            output_path = _default_output_path(
+                client_name or client_uuid[:8], metric, time_range, suffix=".png"
+            )
 
         # Generate the chart (blocking I/O — run in thread pool)
         png_bytes = await asyncio.to_thread(
@@ -831,7 +932,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         ics_content = generate_ics(appointments, cal_config)
 
         if not output_path:
-            output_path = f"/tmp/kahunas_appointments_{time_range}.ics"
+            output_path = _default_output_path("appointments", time_range, suffix=".ics")
 
         await asyncio.to_thread(Path(output_path).write_text, ics_content)
 
@@ -1130,7 +1231,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             if calendar_type == "apple":
                 ics_content = generate_ics(appointments, cal_config)
                 # Save to temp file
-                ics_path = f"/tmp/kahunas_sync_{time_range}.ics"
+                ics_path = _default_output_path("sync", time_range, suffix=".ics")
                 try:
                     with open(ics_path, "w") as f:
                         f.write(ics_content)
@@ -1520,8 +1621,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         chart_data = [{"date": p["date"], "value": p["value"]} for p in points]
 
         if not output_path:
-            safe_name = client_name.replace(" ", "_") or client_uuid[:8]
-            output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
+            output_path = _default_output_path(
+                client_name or client_uuid[:8], metric, time_range, suffix=".png"
+            )
 
         png_bytes = await asyncio.to_thread(
             generate_chart,
@@ -2392,12 +2494,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         Files are saved to output_dir (default: ~/.kahunas/media/).
         """
-        import httpx as httpx_lib
-
         sync = _get_sync()
-        if not output_dir:
-            output_dir = os.path.expanduser("~/.kahunas/media")
-        media_dir = Path(output_dir)
+        media_dir = Path(output_dir or "~/.kahunas/media").expanduser().resolve()
         media_dir.mkdir(parents=True, exist_ok=True)
 
         results: dict[str, Any] = {"output_dir": str(media_dir)}
@@ -2405,55 +2503,67 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         downloaded_attachments = 0
         errors = 0
 
-        async with httpx_lib.AsyncClient(timeout=30.0) as http:
-            # Download pending photos
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            # Photos. The URL comes from the API, so the fetch is scheme
+            # checked and size capped, and every path segment is sanitised
+            # before it is joined onto the output directory.
             pending_photos = await asyncio.to_thread(sync.get_pending_photos, limit)
             for photo in pending_photos:
                 url = photo["photo_url"]
                 checkin_uuid = photo["checkin_uuid"]
                 client_uuid = photo["client_uuid"]
                 try:
-                    resp = await http.get(url)
-                    if resp.status_code == 200:
-                        # Determine extension from content type or URL
-                        ext = ".jpg"
-                        ct = resp.headers.get("content-type", "")
-                        if "png" in ct:
-                            ext = ".png"
-                        elif "webp" in ct:
-                            ext = ".webp"
+                    fetched = await _download_bounded(http, url)
+                    if fetched is None:
+                        errors += 1
+                        continue
+                    content, content_type = fetched
 
-                        client_dir = media_dir / "photos" / client_uuid[:8]
-                        client_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"{checkin_uuid[:8]}_{downloaded_photos}{ext}"
-                        local_path = client_dir / filename
-                        await asyncio.to_thread(local_path.write_bytes, resp.content)
-                        await asyncio.to_thread(
-                            sync.mark_photo_downloaded, checkin_uuid, url, str(local_path)
-                        )
-                        downloaded_photos += 1
-                except Exception:
+                    filename = (
+                        f"{safe_filename(checkin_uuid)[:8]}_"
+                        f"{downloaded_photos}{_media_extension(content_type)}"
+                    )
+                    local_path = safe_join(
+                        media_dir, "photos", safe_filename(client_uuid)[:8], filename
+                    )
+                    await asyncio.to_thread(local_path.parent.mkdir, parents=True, exist_ok=True)
+                    await asyncio.to_thread(local_path.write_bytes, content)
+                    await asyncio.to_thread(
+                        sync.mark_photo_downloaded, checkin_uuid, url, str(local_path)
+                    )
+                    downloaded_photos += 1
+                except (OSError, ValueError, httpx.HTTPError) as exc:
+                    logger.warning("Photo download failed for check-in %s: %s", checkin_uuid, exc)
                     errors += 1
 
-            # Download pending attachments
+            # Attachments. file_name is API supplied and was previously
+            # joined verbatim, which allowed a write outside media_dir.
             pending_atts = await asyncio.to_thread(sync.get_pending_attachments, limit)
             for att in pending_atts:
                 url = att["file_url"]
                 parent_uuid = att["parent_uuid"]
                 file_name = att.get("file_name", "")
                 try:
-                    resp = await http.get(url)
-                    if resp.status_code == 200:
-                        att_dir = media_dir / "attachments" / parent_uuid[:8]
-                        att_dir.mkdir(parents=True, exist_ok=True)
-                        safe_name = file_name or f"attachment_{downloaded_attachments}"
-                        local_path = att_dir / safe_name
-                        await asyncio.to_thread(local_path.write_bytes, resp.content)
-                        await asyncio.to_thread(
-                            sync.mark_attachment_downloaded, parent_uuid, url, str(local_path)
-                        )
-                        downloaded_attachments += 1
-                except Exception:
+                    fetched = await _download_bounded(http, url)
+                    if fetched is None:
+                        errors += 1
+                        continue
+                    content, _ = fetched
+
+                    safe_name = safe_filename(
+                        file_name, fallback=f"attachment_{downloaded_attachments}"
+                    )
+                    local_path = safe_join(
+                        media_dir, "attachments", safe_filename(parent_uuid)[:8], safe_name
+                    )
+                    await asyncio.to_thread(local_path.parent.mkdir, parents=True, exist_ok=True)
+                    await asyncio.to_thread(local_path.write_bytes, content)
+                    await asyncio.to_thread(
+                        sync.mark_attachment_downloaded, parent_uuid, url, str(local_path)
+                    )
+                    downloaded_attachments += 1
+                except (OSError, ValueError, httpx.HTTPError) as exc:
+                    logger.warning("Attachment download failed for %s: %s", parent_uuid, exc)
                     errors += 1
 
         results["photos_downloaded"] = downloaded_photos
