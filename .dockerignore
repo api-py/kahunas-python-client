@@ -13,6 +13,12 @@ tests
 docs
 *.md
 !README.md
+# Never let real credentials or local client data into the build context
 config.yaml
+config.yml
 .env
+*.db
+*.db-wal
+*.db-shm
+.kahunas/
 .claude

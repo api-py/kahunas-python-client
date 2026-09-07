@@ -694,7 +694,21 @@ docker run -p 8000:8000 \
   kahunas-mcp
 ```
 
-The server starts in HTTP mode on port 8000 by default.
+The server starts in HTTP mode on port 8000 by default and binds every
+interface inside the container, because the published port is the boundary
+you control. The container is not a security boundary on its own: anyone
+who can reach the published port gets full access to the coaching account,
+so publish it only behind something that authenticates callers.
+
+Check it is up:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","service":"kahunas-mcp"}
+```
+
+Docker polls the same path as its `HEALTHCHECK`, so `docker ps` reports
+the container healthy once the server is serving.
 
 ### Run (AWS Lambda)
 
@@ -710,10 +724,15 @@ docker run -p 9000:8080 \
   kahunas-mcp-lambda
 ```
 
-For AWS Lambda deployment, push to ECR and create a Lambda function using the container image. Install the optional Lambda dependencies:
+The image installs the Lambda dependencies (`mangum` and the Lambda
+Runtime Interface Client) already, so no extra step is needed. For
+deployment, push to ECR and create a Lambda function from the container
+image.
+
+Outside the container, install the optional Lambda dependencies with:
 
 ```bash
-pip install kahunas-client[lambda]
+uv sync --extra lambda
 ```
 
 ### Environment Variables (Docker)
@@ -726,6 +745,13 @@ pip install kahunas-client[lambda]
 | `KAHUNAS_MCP_LAMBDA` | (unset) | Set to `1` for AWS Lambda mode |
 | `KAHUNAS_EMAIL` | | Coach account email |
 | `KAHUNAS_PASSWORD` | | Coach account password |
+| `KAHUNAS_SYNC_DB` | `~/.kahunas/sync.db` | Local mirror; mount a volume to persist it |
+| `KAHUNAS_OUTPUT_DIR` | `~/.kahunas/output` | Generated charts and calendar files |
+
+The image installs the exact versions recorded in `uv.lock`, so it ships
+the dependency set that CI audits rather than whatever resolves at build
+time. CI builds the image on every run and checks both that the health
+endpoint answers and that the Lambda dependencies are present.
 
 ## Architecture
 

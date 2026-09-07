@@ -144,3 +144,44 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        run: docker build --tag kahunas-mcp:ci .
+
+      - name: Confirm the Lambda runtime dependencies are installed
+        # The entrypoint offers a Lambda mode, which needs these. They were
+        # previously never installed, so that mode failed at startup.
+        run: |
+          docker run --rm --entrypoint python kahunas-mcp:ci -c \
+            "import awslambdaric, mangum; print('lambda runtime dependencies present')"
+
+      - name: Confirm the health endpoint answers
+        # The Dockerfile HEALTHCHECK polls this path. When the route did not
+        # exist, every container was reported unhealthy and restarted.
+        run: |
+          docker run --detach --name kahunas-ci --publish 8000:8000 kahunas-mcp:ci
+          for _ in $(seq 1 30); do
+            if curl --fail --silent --show-error http://localhost:8000/health; then
+              echo "health endpoint answered"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "health endpoint did not answer; container logs follow:" >&2
+          docker logs kahunas-ci >&2
+          exit 1
+
+      - name: Report the container health status
+        if: always()
+        run: |
+          docker inspect --format '{{.State.Health.Status}}' kahunas-ci || true
+          docker rm --force kahunas-ci >/dev/null 2>&1 || true
