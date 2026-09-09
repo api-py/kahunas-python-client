@@ -1151,7 +1151,6 @@ wheels = [
 
 [[package]]
 name = "kahunas-client"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1209,7 +1208,7 @@ requires-dist = [
     { name = "types-openpyxl", marker = "extra == 'dev'", specifier = ">=3.1" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
 ]
-provides-extras = ["lambda", "dev"]
+provides-extras = ["dev", "lambda"]
 
 [[package]]
 name = "keyring"

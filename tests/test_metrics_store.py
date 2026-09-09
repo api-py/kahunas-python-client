@@ -334,3 +334,80 @@ class TestPersistence:
             store = MetricsStore(db_path=db_path)
             assert db_path.parent.exists()
             store.close()
+
+
+class TestConnectionLifecycle:
+    """The store declared a lock and never acquired it at any call site."""
+
+    def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.record("c1", "weight", 82.5, "2024-03-15")
+        store.close()
+        store.close()
+
+    def test_use_after_close_raises_a_clear_error(self, tmp_path: Path) -> None:
+        """Previously this surfaced as a bare sqlite3.ProgrammingError."""
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.record("c1", "weight", 82.5, "2024-03-15")
+        store.close()
+        with pytest.raises(RuntimeError, match="MetricsStore is closed"):
+            store.query("c1", "weight")
+
+    def test_writes_after_close_raise_a_clear_error(self, tmp_path: Path) -> None:
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.close()
+        with pytest.raises(RuntimeError, match="MetricsStore is closed"):
+            store.record("c1", "weight", 82.5, "2024-03-15")
+
+    def test_concurrent_readers_and_writers_do_not_deadlock_or_error(self, tmp_path: Path) -> None:
+        """The lock is reentrant, so nested guarded access must not deadlock."""
+        import threading
+
+        store = MetricsStore(tmp_path / "metrics.db")
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                for i in range(40):
+                    store.record("c1", "weight", 80.0 + i, f"2024-01-{i % 28 + 1:02d}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        def reader() -> None:
+            try:
+                for _ in range(40):
+                    store.query("c1", "weight")
+                    store.get_summary("c1", "weight")
+                    store.list_clients()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "guarded access deadlocked"
+
+        store.close()
+        assert not errors, errors
+
+    def test_only_one_connection_is_opened_under_concurrent_first_use(self, tmp_path: Path) -> None:
+        """Two threads racing first use previously could each build a connection."""
+        import threading
+
+        store = MetricsStore(tmp_path / "metrics.db")
+        barrier = threading.Barrier(4)
+
+        def touch() -> None:
+            barrier.wait()
+            store.record("c1", "weight", 80.0, "2024-01-01")
+
+        threads = [threading.Thread(target=touch) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert store.query("c1", "weight")
+        store.close()

@@ -11,7 +11,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from .persona import PersonaConfig, build_checkin_reminder
+from .persona import build_checkin_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -82,15 +82,17 @@ def find_overdue_clients(
 def build_reminder_message(
     client_name: str,
     days_overdue: int,
-    persona_config: PersonaConfig | None = None,
     custom_message: str = "",
 ) -> str:
-    """Generate a personalised check-in reminder message.
+    """Generate a check-in reminder message.
+
+    Takes no persona: the configurable persona template instructs an
+    assistant, which the get_messaging_persona tool exposes, and does not
+    alter this built-in wording.
 
     Args:
         client_name: The client's first name.
         days_overdue: Number of days since last check-in.
-        persona_config: Optional persona config for tone customisation.
         custom_message: Optional custom message to include.
 
     Returns:
@@ -102,7 +104,6 @@ def build_reminder_message(
     return build_checkin_reminder(
         client_name=client_name,
         days_overdue=days_overdue,
-        persona=persona_config,
     )
 
 

@@ -287,8 +287,14 @@ def format_checkin_summary(
     """
     parsed = [parse_checkin_record(ci) for ci in checkins]
 
-    # Sort by number (most recent first)
-    parsed.sort(key=lambda x: x.get("number", 0), reverse=True)
+    # Most recent first. Ordering keys off the submission date, because the
+    # check-in number is unreliable: it is absent on some records (defaulting
+    # to 0, which sorted a genuinely recent check-in to the end) and does not
+    # always track submission order. Getting this wrong reversed the reported
+    # first and latest dates and inverted every trend direction, so a client
+    # who had lost weight was reported as having gained it. The number is kept
+    # as a tiebreaker for records submitted on the same date.
+    parsed.sort(key=_checkin_sort_key, reverse=True)
 
     # Build unit labels for body measurement fields
     units = {
@@ -355,6 +361,27 @@ def format_checkin_summary(
         result["latest_checkin"] = dates[0] if dates else None
 
     return result
+
+
+def _checkin_sort_key(record: dict[str, Any]) -> tuple[datetime, float]:
+    """Return a sort key ordering check-ins by submission date, then number.
+
+    Records whose date cannot be parsed sort oldest, so a malformed date can
+    never displace a real one from the "latest check-in" position.
+    """
+    raw_date = record.get("date")
+    try:
+        parsed_date = _parse_dt(str(raw_date)) if raw_date else None
+    except (ValueError, TypeError):
+        parsed_date = None
+
+    number = record.get("number") or 0
+    try:
+        numeric = float(number)
+    except (TypeError, ValueError):
+        numeric = 0.0
+
+    return (parsed_date or datetime.min.replace(tzinfo=UTC), numeric)
 
 
 def _calculate_trends(parsed_checkins: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -662,7 +689,7 @@ def _parse_dt(raw: str | datetime) -> datetime:
         "%d %b %Y",
     ):
         try:
-            dt = datetime.strptime(raw_str, fmt)
+            dt = datetime.strptime(raw_str, fmt)  # noqa: DTZ007 - UTC attached on the next line
             return dt.replace(tzinfo=UTC)
         except ValueError:
             continue

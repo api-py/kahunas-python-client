@@ -1,0 +1,151 @@
+name: Release
+
+# Publishing is driven by an annotated tag, so the released artefact is always
+# tied to an immutable commit. Nothing here runs on a pull request: the PR
+# pipeline stays green whether or not publishing credentials are configured.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and verify without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The full quality gate, reused rather than duplicated, so a release cannot
+  # ship code that has not passed lint, types, tests, audit, build and the
+  # container checks.
+  verify:
+    name: Quality gate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  package:
+    name: Build and check the distribution
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build the wheel and sdist
+        run: uv build
+
+      - name: Read the version the package reports
+        id: version
+        run: |
+          version="$(uv run --isolated --no-project --with dist/*.whl \
+            python -c 'import kahunas_client; print(kahunas_client.__version__)')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Package reports version $version"
+
+      - name: Confirm the tag matches the package version
+        # Guards against tagging v0.2.0 while the package still says 0.1.0,
+        # which would publish an artefact whose name and contents disagree.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="${{ steps.version.outputs.version }}"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag v$tag does not match package version $version." \
+                 "Update __version__ in src/kahunas_client/__init__.py or retag."
+            exit 1
+          fi
+          echo "Tag v$tag matches the package version."
+
+      - name: Check the distribution metadata
+        run: uv run --with twine twine check --strict dist/*
+
+      - name: Confirm the wheel installs and its entry points resolve
+        run: |
+          uv run --isolated --no-project --with dist/*.whl python -c "
+          import kahunas_client
+          from kahunas_client.cli.main import cli
+          from kahunas_client.mcp.__main__ import main
+          print('import and entry points OK for', kahunas_client.__version__)
+          "
+
+      - name: Upload the distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A protected environment gives the repository owner a place to require a
+    # manual approval before anything reaches the index.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kahunas-client
+    permissions:
+      # Trusted publishing: PyPI verifies a short-lived OIDC token from this
+      # workflow, so no long-lived API token is stored in the repository.
+      id-token: write
+    steps:
+      - name: Download the distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
+
+  github-release:
+    name: Publish the GitHub release
+    needs: [package, publish-pypi]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      # Signed provenance for the published artefacts, so a consumer can verify
+      # which workflow and commit produced them.
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download the distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

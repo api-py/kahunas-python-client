@@ -509,7 +509,7 @@ def _parse_datetime(raw: str) -> datetime:
         "%d/%m/%Y",
     ):
         try:
-            dt = datetime.strptime(raw, fmt)
+            dt = datetime.strptime(raw, fmt)  # noqa: DTZ007 - UTC attached on the next line
             return dt.replace(tzinfo=UTC)
         except ValueError:
             continue

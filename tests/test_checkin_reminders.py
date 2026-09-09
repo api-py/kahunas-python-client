@@ -8,7 +8,6 @@ from kahunas_client.checkin_reminders import (
     build_reminder_message,
     find_overdue_clients,
 )
-from kahunas_client.persona import PersonaConfig
 
 # ── find_overdue_clients ──
 
@@ -154,13 +153,22 @@ class TestBuildReminderMessage:
         msg = build_reminder_message("Diana", 5, custom_message=custom)
         assert msg == "Custom: Diana"
 
-    def test_with_persona_config(self) -> None:
-        persona = PersonaConfig(
-            weight_deviation_pct=10.0,
-            sleep_minimum=6.0,
-            step_minimum=8000,
-        )
-        msg = build_reminder_message("Eve", 7, persona_config=persona)
+    def test_wording_is_fixed_and_does_not_take_a_persona(self) -> None:
+        """The built-in wording is not persona driven.
+
+        A persona argument used to be accepted here and silently ignored,
+        which implied the configured persona shaped this message. It does
+        not: the persona template instructs an assistant and is surfaced by
+        the get_messaging_persona tool. This pins that contract so the
+        misleading parameter cannot quietly return.
+        """
+        import inspect
+
+        signature = inspect.signature(build_reminder_message)
+        assert "persona_config" not in signature.parameters
+        assert "persona" not in signature.parameters
+
+        msg = build_reminder_message("Eve", 7)
         assert "Eve" in msg
         assert "7" in msg
 

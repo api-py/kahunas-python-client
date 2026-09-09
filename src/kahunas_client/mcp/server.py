@@ -281,7 +281,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     # ── Operational endpoints ──
 
     @mcp.custom_route("/health", methods=["GET"])
-    async def health(request: Request) -> JSONResponse:
+    async def health(request: Request) -> JSONResponse:  # noqa: ARG001 - required by Starlette
         """Report liveness for container orchestrators.
 
         The Dockerfile HEALTHCHECK, and the equivalent probes in Azure
@@ -1739,11 +1739,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         include_photos: bool = True,
         include_checkins: bool = True,
         include_progress: bool = True,
-        include_workouts: bool = True,
         include_habits: bool = True,
         include_chat: bool = True,
     ) -> str:
-        """Export all data for a client to Excel files."""
+        """Export all data for a client to Excel files.
+
+        Workout programs are not client scoped here; use
+        export_workout_programs for those.
+        """
         export = _get_export()
         path = await export.export_client(
             client_uuid=client_uuid,
@@ -1751,7 +1754,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             include_photos=include_photos,
             include_checkins=include_checkins,
             include_progress=include_progress,
-            include_workouts=include_workouts,
             include_habits=include_habits,
             include_chat=include_chat,
         )
@@ -1984,14 +1986,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         config = client._config
         uuids = [u.strip() for u in client_uuids.split(",") if u.strip()]
 
-        persona = PersonaConfig.from_config(
-            persona_template=config.persona_template,
-            persona_template_path=config.persona_template_path,
-            weight_deviation_pct=config.persona_weight_deviation_pct,
-            sleep_minimum=config.persona_sleep_minimum,
-            step_minimum=config.persona_step_minimum,
-        )
-
         results: list[dict[str, Any]] = []
 
         for uuid in uuids:
@@ -2006,7 +2000,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 message = build_reminder_message(
                     first_name,
                     config.checkin_reminder_days,
-                    persona,
                     custom_message,
                 )
 
@@ -2197,7 +2190,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         """
         client = _get_client()
         config = client._config
-
         persona = PersonaConfig.from_config(
             persona_template=config.persona_template,
             persona_template_path=config.persona_template_path,
@@ -2205,7 +2197,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             sleep_minimum=config.persona_sleep_minimum,
             step_minimum=config.persona_step_minimum,
         )
-
         return _compact(get_persona_summary(persona))
 
     @mcp.tool()
@@ -2231,14 +2222,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         first_name = client_data.get("first_name", "Client")
 
-        persona = PersonaConfig.from_config(
-            persona_template=config.persona_template,
-            persona_template_path=config.persona_template_path,
-            weight_deviation_pct=config.persona_weight_deviation_pct,
-            sleep_minimum=config.persona_sleep_minimum,
-            step_minimum=config.persona_step_minimum,
-        )
-
         if message_type == "anomaly":
             # Fetch anomaly data for preview
             checkin_resp = await client.list_client_checkins(client_uuid)
@@ -2261,10 +2244,10 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             )
             anomalies_data = scan_client_anomalies(checkins, thresholds=thresholds)
             flat_anomalies = [a for alist in anomalies_data.values() for a in alist]
-            message = build_anomaly_warning(first_name, flat_anomalies, persona, custom_context)
+            message = build_anomaly_warning(first_name, flat_anomalies, custom_context)
         else:
             message = build_reminder_message(
-                first_name, config.checkin_reminder_days, persona, custom_context
+                first_name, config.checkin_reminder_days, custom_context
             )
 
         return _compact(

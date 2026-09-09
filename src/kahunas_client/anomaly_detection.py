@@ -258,7 +258,10 @@ def scan_client_anomalies(
         thresholds = DEFAULT_THRESHOLDS
 
     # Build per-metric timeseries from check-ins
-    all_metrics = set(BODY_METRICS | LIFESTYLE_METRICS | {"water_intake"})
+    # "steps" is included so the configured step minimum has data to check
+    # against. Without it no step timeseries was ever built, which is why
+    # KAHUNAS_ANOMALY_STEP_MINIMUM had no effect.
+    all_metrics = set(BODY_METRICS | LIFESTYLE_METRICS | {"water_intake", "steps"})
     timeseries: dict[str, list[dict[str, Any]]] = {m: [] for m in all_metrics}
 
     for checkin in checkins:
@@ -270,6 +273,14 @@ def scan_client_anomalies(
                 if parsed is not None:
                     timeseries[metric].append({"date": date, "value": parsed})
 
+    # detect_anomalies compares each point with the one before it and requires
+    # chronological order. Nothing enforced that, so a caller passing the API's
+    # newest-first ordering had every comparison reversed: a client steadily
+    # losing weight was reported as gaining it, and changes that were within
+    # threshold in one direction were raised as anomalies in the other.
+    for points in timeseries.values():
+        points.sort(key=lambda point: _sort_date(point.get("date")))
+
     # Detect anomalies per metric
     results: dict[str, list[dict[str, Any]]] = {}
     for metric, points in timeseries.items():
@@ -279,21 +290,35 @@ def scan_client_anomalies(
         if anomalies:
             results[metric] = anomalies
 
-    # Check minimum thresholds for sleep
-    sleep_points = timeseries.get("sleep_quality", [])
-    if sleep_points:
-        sleep_data = [
-            {"date": p["date"], "value": p["value"], "metric": "sleep_quality"}
-            for p in sleep_points
-        ]
-        sleep_warnings = check_minimum_thresholds(
-            sleep_data,
+    # Check absolute minimum thresholds. Both sleep and steps are checked:
+    # step_minimum was previously accepted and documented but never applied,
+    # so a client far below their step target produced no warning at all.
+    for metric, result_key in (
+        ("sleep_quality", "sleep_quality_minimum"),
+        ("steps", "steps_minimum"),
+    ):
+        points = timeseries.get(metric, [])
+        if not points:
+            continue
+        warnings = check_minimum_thresholds(
+            [{"date": p["date"], "value": p["value"], "metric": metric} for p in points],
             sleep_minimum=sleep_minimum,
+            step_minimum=step_minimum,
         )
-        if sleep_warnings:
-            results.setdefault("sleep_quality_minimum", []).extend(sleep_warnings)
+        if warnings:
+            results.setdefault(result_key, []).extend(warnings)
 
     return results
+
+
+def _sort_date(raw: Any) -> datetime:
+    """Return a sortable timestamp for a data point.
+
+    A point whose date cannot be parsed sorts oldest, so it can never be
+    mistaken for the most recent reading.
+    """
+    parsed = _parse_date(raw) if raw else None
+    return parsed or datetime.min.replace(tzinfo=UTC)
 
 
 def _to_float(value: Any) -> float | None:
