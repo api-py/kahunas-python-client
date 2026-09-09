@@ -1,15 +1,17 @@
 name: Release
 
-# Publishing is driven by an annotated tag, so the released artefact is always
-# tied to an immutable commit. Nothing here runs on a pull request: the PR
-# pipeline stays green whether or not publishing credentials are configured.
+# Driven by an annotated tag, so every published artefact is tied to an
+# immutable commit. The wheel and sdist are attached to the GitHub release for
+# direct download; nothing is pushed to PyPI or any other index, so no
+# publishing credentials exist and none are needed. Nothing here runs on a
+# pull request.
 on:
   push:
     tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build and verify without publishing"
+        description: "Build and verify without creating a release"
         type: boolean
         default: true
 
@@ -92,43 +94,16 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  publish-pypi:
-    name: Publish to PyPI
-    needs: package
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # A protected environment gives the repository owner a place to require a
-    # manual approval before anything reaches the index.
-    environment:
-      name: pypi
-      url: https://pypi.org/p/kahunas-client
-    permissions:
-      # Trusted publishing: PyPI verifies a short-lived OIDC token from this
-      # workflow, so no long-lived API token is stored in the repository.
-      id-token: write
-    steps:
-      - name: Download the distribution
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          print-hash: true
-
   github-release:
-    name: Publish the GitHub release
-    needs: [package, publish-pypi]
+    name: Attach the wheel to a GitHub release
+    needs: package
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
-      # Signed provenance for the published artefacts, so a consumer can verify
-      # which workflow and commit produced them.
+      # Signed provenance for the attached artefacts, so whoever downloads the
+      # wheel can verify which workflow and commit produced it.
       attestations: write
       id-token: write
     steps:
@@ -143,9 +118,31 @@ jobs:
         with:
           subject-path: dist/*
 
+      - name: Compose the install instructions
+        id: notes
+        run: |
+          wheel="$(basename dist/*.whl)"
+          {
+            echo "notes<<EOF"
+            echo "## Install"
+            echo
+            echo "Download \`$wheel\` from the assets below, then:"
+            echo
+            echo '```bash'
+            echo "pip install ./$wheel"
+            echo '```'
+            echo
+            echo "This package is not published to PyPI. The wheel attached here"
+            echo "is the distribution, built and verified by the pipeline on this"
+            echo "tag, and carries signed build provenance."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body: ${{ steps.notes.outputs.notes }}
+          # Appended below the install instructions above.
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -27,7 +27,7 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
 - **Quality Gates** — CI enforces `ruff` (PEP 8, PEP 257, bandit, unused arguments), `mypy --strict`, a coverage floor over 981 tests on Python 3.12 and 3.13, a `pip-audit` of the locked dependency set, and CodeQL static analysis
-- **Automated Releases** — Tag driven publication to PyPI via trusted publishing, with the full CI gate rerun, tag and version consistency enforced, and signed build provenance on every artefact
+- **Automated Releases** — Tag driven builds attached to GitHub Releases as a downloadable wheel, with the full CI gate rerun, tag and version consistency enforced, and signed build provenance on every artefact
 
 ## Requirements
 
@@ -36,7 +36,10 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 
 ## Installation
 
-The package is not published to PyPI yet, so install it from source:
+The package is not published to PyPI. Either download a prebuilt wheel
+from the [releases page](https://github.com/api-py/kahunas-python-client/releases)
+(see [Installing a released build](#installing-a-released-build)), or
+install from source:
 
 ```bash
 git clone https://github.com/api-py/kahunas-python-client.git
@@ -865,24 +868,35 @@ The workflow then:
 3. **Refuses a mismatched tag.** Tagging `v0.2.0` while the package still
    reports `0.1.0` fails the build rather than publishing an artefact whose
    name and contents disagree.
-4. **Publishes to PyPI** using trusted publishing. PyPI verifies a
-   short-lived OIDC token from the workflow, so no long-lived API token is
-   stored in the repository.
-5. **Creates the GitHub release** with the artefacts attached and signed
-   build provenance, so a consumer can verify which workflow and commit
-   produced them.
+4. **Creates a GitHub release** with the wheel and sdist attached as
+   downloadable assets, install instructions in the body, and signed build
+   provenance so whoever downloads the wheel can verify which workflow and
+   commit produced it.
 
-`workflow_dispatch` runs steps 1 and 2 only, which is a safe way to
-rehearse a release without publishing anything.
+Nothing is pushed to PyPI or any other index, so the repository holds no
+publishing credentials and none are needed. `workflow_dispatch` runs steps
+1 to 3 only, which rehearses a release without creating one.
 
-**One-time setup before the first publish.** Create a
-[PyPI trusted publisher](https://docs.pypi.org/trusted-publishers/) for
-this repository with workflow `release.yml` and environment `pypi`, then
-add a `pypi` environment under repository settings. Protecting that
-environment with a required reviewer gives you a manual approval gate
-before anything reaches the index. Until this is configured the publish
-job is the only thing that fails, and only on a tag: the pull request
-pipeline is unaffected.
+### Installing a released build
+
+Download the `.whl` from the
+[latest release](https://github.com/api-py/kahunas-python-client/releases/latest)
+and install it directly:
+
+```bash
+pip install ./kahunas_client-0.2.0-py3-none-any.whl
+
+# Or with uv, into the current project
+uv pip install ./kahunas_client-0.2.0-py3-none-any.whl
+```
+
+The attached wheel is the distribution the pipeline built and verified on
+that tag. To confirm it came from this repository before installing:
+
+```bash
+gh attestation verify ./kahunas_client-0.2.0-py3-none-any.whl \
+  --repo api-py/kahunas-python-client
+```
 
 ### Standards
 
