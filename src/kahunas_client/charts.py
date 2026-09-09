@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -204,7 +204,10 @@ def _parse_date(date_str: str) -> datetime:
     ]
     for fmt in formats:
         try:
-            return datetime.strptime(date_str, fmt)
+            # Interpreted as UTC, matching the parsers in calendar_sync and
+            # checkin_history. Returning naive datetimes here risked a
+            # TypeError the moment an aware one reached the same list.
+            return datetime.strptime(date_str, fmt).replace(tzinfo=UTC)
         except ValueError:
             continue
     raise ValueError(f"Cannot parse date: {date_str}")

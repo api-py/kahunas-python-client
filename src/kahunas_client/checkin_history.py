@@ -689,7 +689,7 @@ def _parse_dt(raw: str | datetime) -> datetime:
         "%d %b %Y",
     ):
         try:
-            dt = datetime.strptime(raw_str, fmt)
+            dt = datetime.strptime(raw_str, fmt)  # noqa: DTZ007 - UTC attached on the next line
             return dt.replace(tzinfo=UTC)
         except ValueError:
             continue

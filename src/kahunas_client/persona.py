@@ -169,15 +169,20 @@ def render_message(
 def build_checkin_reminder(
     client_name: str,
     days_overdue: int,
-    persona: PersonaConfig | None = None,
     extra_context: str = "",
 ) -> str:
     """Build a check-in reminder message for an overdue client.
 
+    This is the built-in fallback wording, already written in the default
+    coaching voice. It takes no persona: the configurable persona template is
+    a set of instructions for an assistant, surfaced by the
+    get_messaging_persona tool, and shapes the messages that assistant
+    composes. It is not substituted into this fixed template. The parameter
+    used to be accepted here and silently ignored, which implied otherwise.
+
     Args:
         client_name: The client's first name.
         days_overdue: Number of days since their last check-in.
-        persona: Optional persona config (for future persona-aware reminders).
         extra_context: Additional context to include in the message.
 
     Returns:
@@ -194,7 +199,6 @@ def build_checkin_reminder(
 def build_anomaly_warning(
     client_name: str,
     anomalies: list[dict[str, Any]],
-    persona: PersonaConfig | None = None,
     extra_context: str = "",
 ) -> str:
     """Build an anomaly warning message for a client.
@@ -202,7 +206,6 @@ def build_anomaly_warning(
     Args:
         client_name: The client's first name.
         anomalies: List of anomaly dicts with 'metric', 'message' keys.
-        persona: Optional persona config.
         extra_context: Additional context to include.
 
     Returns:

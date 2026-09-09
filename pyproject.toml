@@ -127,6 +127,13 @@ select = [
     "SIM",  # flake8-simplify
     "TCH",  # flake8-type-checking
     "RUF",  # ruff-specific
+    "ARG",  # flake8-unused-arguments: catches silently ignored parameters
+    "DTZ",  # flake8-datetimez: catches naive datetimes
+    "C4",   # flake8-comprehensions
+    "RET",  # flake8-return
+    "PIE",  # flake8-pie
+    "LOG",  # flake8-logging
+    "G",    # flake8-logging-format
 ]
 ignore = ["UP046"]  # Generic[T] subclass is needed for Pydantic models
 
@@ -141,6 +148,10 @@ convention = "pep257"
     "S105",
     "S106",    # obviously fake credentials in fixtures
     "D",       # test names and class docstrings carry the intent
+    "ARG",     # mock transport lambdas and pytest fixture params have fixed
+               # signatures; the rule targets production API design
+    "DTZ",     # some tests construct naive datetimes deliberately, to prove
+               # the code under test attaches a timezone
 ]
 
 [tool.ruff.lint.isort]
