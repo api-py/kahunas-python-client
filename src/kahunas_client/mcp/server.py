@@ -1739,11 +1739,14 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         include_photos: bool = True,
         include_checkins: bool = True,
         include_progress: bool = True,
-        include_workouts: bool = True,
         include_habits: bool = True,
         include_chat: bool = True,
     ) -> str:
-        """Export all data for a client to Excel files."""
+        """Export all data for a client to Excel files.
+
+        Workout programs are not client scoped here; use
+        export_workout_programs for those.
+        """
         export = _get_export()
         path = await export.export_client(
             client_uuid=client_uuid,
@@ -1751,7 +1754,6 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             include_photos=include_photos,
             include_checkins=include_checkins,
             include_progress=include_progress,
-            include_workouts=include_workouts,
             include_habits=include_habits,
             include_chat=include_chat,
         )

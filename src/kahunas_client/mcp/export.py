@@ -150,11 +150,18 @@ class ExportManager:
         include_photos: bool = True,
         include_checkins: bool = True,
         include_progress: bool = True,
-        include_workouts: bool = True,
         include_habits: bool = True,
         include_chat: bool = True,
     ) -> Path:
-        """Export all data for a single client."""
+        """Export all data for a single client.
+
+        There is deliberately no workouts toggle. One was accepted here and by
+        the export_client_data tool, but nothing ever read it and no workout
+        file was produced, so a caller asking to include workouts silently got
+        none. Advertising an option that does nothing is worse than not
+        offering it, particularly on a tool an LLM calls. Coach wide workout
+        programs are still exported by export_workout_programs.
+        """
         # Get client info
         resp = await self._client.get_client_action("view", client_uuid)
         client_data = self._parse_response(resp)
