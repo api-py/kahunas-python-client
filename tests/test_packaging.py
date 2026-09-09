@@ -80,3 +80,27 @@ class TestEntryPoints:
             ep for ep in metadata.entry_points(group="console_scripts") if ep.name == command
         ]
         assert callable(entry.load())
+
+
+class TestGeneratedFilesAreNotCommitted:
+    """`uv export` output must not be committed alongside uv.lock.
+
+    A committed export is never installed from: the Dockerfile runs the
+    export itself during the build. It only drifts from uv.lock, and it
+    attracts dependency bots, which raise pull requests against pins that
+    nothing reads while the real lockfile goes unwatched.
+    """
+
+    def test_the_docker_export_is_absent(self) -> None:
+        assert not (_PYPROJECT.parent / "dockerreq.txt").exists()
+
+    def test_the_docker_export_is_ignored(self) -> None:
+        ignored = (_PYPROJECT.parent / ".gitignore").read_text(encoding="utf-8").split()
+        assert "dockerreq.txt" in ignored
+
+    def test_the_lockfile_is_the_only_committed_pin_set(self) -> None:
+        """uv.lock is the single source of dependency truth."""
+        root = _PYPROJECT.parent
+        assert (root / "uv.lock").is_file()
+        exports = [p.name for p in root.glob("*.txt") if p.name.startswith("requirements")]
+        assert exports == []

@@ -7,10 +7,16 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    # The pipeline references ten actions. A limit below that silently drops
+    # the tail of the queue, which is how actions/download-artifact sat four
+    # majors behind without a pull request ever being raised for it.
+    open-pull-requests-limit: 10
     commit-message:
       prefix: "ci"
 
+  # uv.lock is the single source of dependency truth. The container installs
+  # from it via `uv export` at build time, so there is no second requirements
+  # file for this to keep in step.
   - package-ecosystem: uv
     directory: "/"
     schedule:
