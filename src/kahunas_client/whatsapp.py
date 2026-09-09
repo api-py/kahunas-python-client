@@ -6,9 +6,9 @@ WhatsApp contacts by normalised phone number.
 
 Configuration:
     Set these environment variables or pass via KahunasConfig/WhatsAppConfig:
-    - WHATSAPP_TOKEN: Meta Cloud API access token
-    - WHATSAPP_PHONE_NUMBER_ID: Your WhatsApp Business phone number ID
-    - WHATSAPP_DEFAULT_COUNTRY_CODE: Default country code (default: "44" for UK)
+    - KAHUNAS_WHATSAPP_TOKEN: Meta Cloud API access token
+    - KAHUNAS_WHATSAPP_PHONE_NUMBER_ID: Your WhatsApp Business phone number ID
+    - KAHUNAS_WHATSAPP_DEFAULT_COUNTRY_CODE: Default country code (default: "44" for UK)
 """
 
 from __future__ import annotations
@@ -19,12 +19,19 @@ from typing import Any
 
 import httpx
 
+from .jsonutil import as_dict
+
 logger = logging.getLogger(__name__)
 
 _GRAPH_API = "https://graph.facebook.com/v21.0"
 
 # Chars to strip when normalising a phone number
 _STRIP_RE = re.compile(r"[\s\-\(\)\.]+")
+
+# A cleaned number: optional leading +, then digits only. E.164 allows at
+# most 15 digits; a leading 00 international prefix or a national trunk 0
+# is still present at this point, so the bound allows for those.
+_E164_CANDIDATE = re.compile(r"\+?\d{6,17}")
 
 
 class WhatsAppConfig:
@@ -37,6 +44,14 @@ class WhatsAppConfig:
         default_country_code: str = "44",
         api_version: str = "v21.0",
     ) -> None:
+        """Store WhatsApp Business API settings.
+
+        Args:
+            access_token: Meta Cloud API access token.
+            phone_number_id: WhatsApp Business phone number id.
+            default_country_code: Country code applied to national numbers.
+            api_version: Graph API version to call.
+        """
         self.access_token = access_token
         self.phone_number_id = phone_number_id
         self.default_country_code = default_country_code
@@ -44,13 +59,16 @@ class WhatsAppConfig:
 
     @property
     def base_url(self) -> str:
+        """Return the Graph API base URL for the configured version."""
         return f"https://graph.facebook.com/{self.api_version}"
 
     @property
     def messages_url(self) -> str:
+        """Return the endpoint that accepts outbound messages."""
         return f"{self.base_url}/{self.phone_number_id}/messages"
 
     def is_configured(self) -> bool:
+        """Return whether both an access token and a phone number id are set."""
         return bool(self.access_token and self.phone_number_id)
 
 
@@ -77,6 +95,13 @@ def normalise_phone(phone: str, default_country_code: str = "44") -> str:
     if not clean:
         return ""
 
+    # Reject anything that is not a phone number. Previously an unrecognised
+    # format was returned unchanged, so free text in the client's phone field
+    # reached the WhatsApp API as a recipient.
+    if not _E164_CANDIDATE.fullmatch(clean):
+        logger.debug("Ignoring unparseable phone number: %r", phone)
+        return ""
+
     # Handle + prefix
     if clean.startswith("+"):
         return clean[1:]  # remove the + for WhatsApp API format
@@ -94,7 +119,7 @@ def normalise_phone(phone: str, default_country_code: str = "44") -> str:
     if default_country_code == "44" and clean.startswith("7") and len(clean) == 10:
         return "44" + clean
 
-    # Already normalised or unknown format — return as-is
+    # Already normalised, or a format this function does not recognise.
     return clean
 
 
@@ -120,10 +145,12 @@ class WhatsAppClient:
     """
 
     def __init__(self, config: WhatsAppConfig) -> None:
+        """Build a client for ``config``. Use it as an async context manager."""
         self._config = config
         self._http: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> WhatsAppClient:
+        """Open the HTTP client and attach the bearer token."""
         self._http = httpx.AsyncClient(
             timeout=30.0,
             headers={
@@ -134,11 +161,13 @@ class WhatsAppClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        """Close the HTTP client."""
         if self._http:
             await self._http.aclose()
             self._http = None
 
     def _ensure_http(self) -> httpx.AsyncClient:
+        """Return the open HTTP client, or raise if used outside the context."""
         if not self._http:
             raise RuntimeError("WhatsAppClient not initialized. Use 'async with' context manager.")
         return self._http
@@ -251,12 +280,14 @@ class WhatsAppClient:
     def _handle_response(resp: httpx.Response) -> dict[str, Any]:
         """Parse WhatsApp API response, raising on errors."""
         try:
-            data = resp.json()
+            data = as_dict(resp.json())
         except Exception:
+            data = {}
+        if not data:
             data = {"error": {"message": resp.text[:300], "code": resp.status_code}}
 
         if resp.status_code >= 400:
-            err = data.get("error", {})
+            err = as_dict(data.get("error"))
             msg = err.get("message", f"HTTP {resp.status_code}")
             code = err.get("code", resp.status_code)
             raise WhatsAppError(f"WhatsApp API error ({code}): {msg}")
@@ -289,6 +320,8 @@ def match_clients_to_whatsapp(
         phone = client.get("phone", "")
         normalised = normalise_phone(phone, default_country_code)
         client["whatsapp_number"] = normalised
-        # A valid mobile number should be at least 10 digits
-        client["whatsapp_ready"] = len(normalised) >= 10
+        # A valid international mobile number is at least 10 digits. The
+        # normaliser now rejects non numeric input, so a length check here is
+        # a check on digits rather than on arbitrary characters.
+        client["whatsapp_ready"] = len(normalised) >= 10 and normalised.isdigit()
     return clients

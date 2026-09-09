@@ -867,3 +867,57 @@ class TestCloseReopen:
         s1.close()
         s2 = SyncStore(db_path=str(db_path))
         s2.close()
+
+
+class TestConnectionLifecycle:
+    """Reads previously touched the connection with no lock held."""
+
+    def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        store = SyncStore(str(tmp_path / "sync.db"))
+        store.close()
+        store.close()
+
+    def test_reads_after_close_raise_a_clear_error(self, tmp_path: Path) -> None:
+        """Previously this surfaced as a bare sqlite3.ProgrammingError."""
+        store = SyncStore(str(tmp_path / "sync.db"))
+        store.close()
+        with pytest.raises(RuntimeError, match="SyncStore is closed"):
+            store.list_clients()
+
+    def test_writes_after_close_raise_a_clear_error(self, tmp_path: Path) -> None:
+        store = SyncStore(str(tmp_path / "sync.db"))
+        store.close()
+        with pytest.raises(RuntimeError, match="SyncStore is closed"):
+            store.upsert_client({"uuid": "c1", "first_name": "Jane"})
+
+    def test_concurrent_reads_and_writes_do_not_corrupt_state(self, tmp_path: Path) -> None:
+        """The lock is reentrant, so nested guarded access must not deadlock."""
+        import threading
+
+        store = SyncStore(str(tmp_path / "sync.db"))
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                for i in range(50):
+                    store.upsert_client({"uuid": f"c{i}", "first_name": f"Client {i}"})
+            except BaseException as exc:
+                errors.append(exc)
+
+        def reader() -> None:
+            try:
+                for _ in range(50):
+                    store.list_clients()
+                    store.get_sync_summary()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "guarded access deadlocked"
+
+        store.close()
+        assert not errors, errors

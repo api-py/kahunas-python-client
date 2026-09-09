@@ -8,16 +8,22 @@ import contextvars
 import json
 import logging
 import os
+import re
+import secrets
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
+import httpx
 from fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 from ..anomaly_detection import parse_thresholds, scan_client_anomalies
 from ..checkin_reminders import build_reminder_message, find_overdue_clients
 from ..client import KahunasClient
 from ..config import KahunasConfig
 from ..data_sync import SyncStore
+from ..jsonutil import as_dict_list, first_list
 from ..metrics_store import (
     MEASUREMENT_SETTINGS,
     MetricsStore,
@@ -33,9 +39,109 @@ from ..pdf_export import (
 )
 from ..persona import PersonaConfig, build_anomaly_warning, get_persona_summary
 from ..phone_alignment import build_phone_alignment_report
+from ..safepath import safe_filename, safe_join
 from .export import ExportManager
 
+if TYPE_CHECKING:
+    from starlette.requests import Request
+
 logger = logging.getLogger(__name__)
+
+# Media download policy. URLs and filenames in the sync database come from
+# the Kahunas API, so both are treated as untrusted input.
+_ALLOWED_MEDIA_SCHEMES = frozenset({"http", "https"})
+_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+_MEDIA_EXTENSIONS = {
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+}
+
+
+def _is_downloadable_url(url: str) -> bool:
+    """Return whether ``url`` is an absolute HTTP(S) URL with a host.
+
+    Rejects ``file://`` and other schemes that would make the download
+    tool read local or internal resources on behalf of a caller.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in _ALLOWED_MEDIA_SCHEMES and bool(parsed.netloc)
+
+
+async def _download_bounded(http: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+    """Stream ``url`` into memory, stopping past the size cap.
+
+    Args:
+        http: Client to fetch with.
+        url: Untrusted media URL from the sync database.
+
+    Returns:
+        A ``(body, content_type)`` pair, or ``None`` when the URL is not
+        fetchable, the response is not a success, or the payload exceeds
+        :data:`_MAX_MEDIA_BYTES`. Streaming means an oversized response is
+        abandoned mid transfer rather than being buffered in full first.
+    """
+    if not _is_downloadable_url(url):
+        logger.warning("Refusing to download from unsupported URL: %.100s", url)
+        return None
+
+    async with http.stream("GET", url) as resp:
+        if resp.status_code != 200:
+            logger.warning("Download failed with status %s: %.100s", resp.status_code, url)
+            return None
+
+        declared = resp.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > _MAX_MEDIA_BYTES:
+            logger.warning("Skipping %.100s: declared size %s exceeds cap", url, declared)
+            return None
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > _MAX_MEDIA_BYTES:
+                logger.warning("Skipping %.100s: body exceeded %d bytes", url, _MAX_MEDIA_BYTES)
+                return None
+            chunks.append(chunk)
+
+        return b"".join(chunks), resp.headers.get("content-type", "")
+
+
+def _default_output_dir() -> Path:
+    """Return the private directory used when a caller names no output path.
+
+    Generated charts and calendar files carry client names and health data.
+    The previous default wrote them to fixed ``/tmp/kahunas_*`` paths, which
+    on a shared host are world readable and can be pre-created as symlinks
+    pointing somewhere else. This directory is owned by the running user and
+    created with owner only permissions.
+    """
+    output_dir = Path(os.getenv("KAHUNAS_OUTPUT_DIR", "~/.kahunas/output")).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return output_dir
+
+
+def _default_output_path(*name_parts: str, suffix: str) -> str:
+    """Build a private output path from sanitised ``name_parts``.
+
+    A random component keeps two concurrent calls for the same client from
+    overwriting one another, and stops the filename being guessable by
+    another local user.
+    """
+    stem = "_".join(safe_filename(part) for part in name_parts if part) or "kahunas"
+    unique = secrets.token_hex(4)
+    return str(_default_output_dir() / f"{safe_filename(stem)}_{unique}{suffix}")
+
+
+def _media_extension(content_type: str, default: str = ".jpg") -> str:
+    """Map a response content type to a file extension."""
+    base = content_type.split(";", 1)[0].strip().lower()
+    return _MEDIA_EXTENSIONS.get(base, default)
+
 
 # Session-isolated state using contextvars so each HTTP session gets its own
 # KahunasClient, ExportManager, and MetricsStore instance.  For stdio
@@ -89,6 +195,36 @@ def _get_sync() -> SyncStore:
     return store
 
 
+def _web_payload(resp: httpx.Response, tool: str) -> str:
+    """Return a web app response body as JSON text, or a structured error.
+
+    The Kahunas web app answers an expired session with a full HTML login
+    page under HTTP 200. Returning that body verbatim handed the model a
+    document of markup with no indication that the call had failed, and no
+    way to tell an empty result from a lost session. A non JSON body now
+    becomes a short error naming the tool and the likely cause.
+
+    A JSON body is passed through unchanged, so successful payloads keep
+    exactly the shape callers already receive.
+    """
+    text = resp.text
+    try:
+        json.loads(text)
+    except ValueError:
+        snippet = re.sub(r"\s+", " ", text).strip()[:200]
+        logger.warning("%s received a non JSON response (status %s)", tool, resp.status_code)
+        return _compact(
+            {
+                "error": (
+                    f"{tool} did not return JSON (HTTP {resp.status_code}). "
+                    "The session may have expired; call login() again."
+                ),
+                "snippet": snippet,
+            }
+        )
+    return text
+
+
 def _compact(data: Any) -> str:
     """Serialize to compact JSON, stripping null/empty/default values.
 
@@ -133,7 +269,6 @@ def _strip_empty(obj: Any) -> Any:
 
 def create_server(config: KahunasConfig | None = None) -> FastMCP:
     """Create and configure the MCP server with all Kahunas tools."""
-
     mcp = FastMCP(
         "kahunas",
         instructions=(
@@ -143,12 +278,42 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         ),
     )
 
+    # ── Operational endpoints ──
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        """Report liveness for container orchestrators.
+
+        The Dockerfile HEALTHCHECK, and the equivalent probes in Azure
+        Container Instances and Kubernetes, poll this path. Without it the
+        only route served is /mcp, so every probe failed and orchestrators
+        restarted an otherwise healthy container.
+
+        Deliberately reports process liveness only. It performs no call to
+        the Kahunas API, so a container is not restarted because an upstream
+        dependency is briefly unavailable, and the endpoint cannot be used
+        to probe credential validity from outside.
+        """
+        return JSONResponse({"status": "ok", "service": "kahunas-mcp"})
+
     # ── Lifecycle ──
 
     @mcp.tool()
     async def login() -> str:
         """Authenticate with Kahunas. Call this first before using other tools."""
         cfg = config or KahunasConfig.from_env()
+
+        # A second login previously replaced the client without closing the
+        # first, leaking its connection pool for the life of the process.
+        previous = _client_var.get()
+        if previous is not None:
+            try:
+                await previous.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.warning("Closing the previous Kahunas session failed: %s", exc)
+            _client_var.set(None)
+            _export_var.set(None)
+
         client = KahunasClient(cfg)
         try:
             await client.__aenter__()
@@ -311,7 +476,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def list_clients() -> str:
         """List all coaching clients."""
         resp = await _get_client().list_clients()
-        return resp.text
+        return _web_payload(resp, "list_clients")
 
     @mcp.tool()
     async def create_client(
@@ -332,13 +497,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         if package_uuid:
             data["package_uuid"] = package_uuid
         resp = await _get_client().create_client(data)
-        return resp.text
+        return _web_payload(resp, "create_client")
 
     @mcp.tool()
     async def get_client(client_uuid: str, action: str = "view") -> str:
         """Get client details. Actions: view, edit, delete, suspend, activate."""
         resp = await _get_client().get_client_action(action, client_uuid)
-        return resp.text
+        return _web_payload(resp, "get_client")
 
     # ── Diet & Supplements ──
 
@@ -346,13 +511,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def manage_diet_plan(action: str, plan_id: str = "") -> str:
         """Manage diet plans. Actions: list, view, create, update, delete."""
         resp = await _get_client().diet_plan_action(action, plan_id)
-        return resp.text
+        return _web_payload(resp, "manage_diet_plan")
 
     @mcp.tool()
     async def manage_supplement_plan(action: str, plan_id: str = "") -> str:
         """Manage supplement plans. Actions: list, view, create, update, delete."""
         resp = await _get_client().supplement_plan_action(action, plan_id)
-        return resp.text
+        return _web_payload(resp, "manage_supplement_plan")
 
     # ── Check-ins ──
 
@@ -360,19 +525,19 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def view_checkin(checkin_uuid: str) -> str:
         """View a client check-in with all submitted data."""
         resp = await _get_client().get_checkin(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "view_checkin")
 
     @mcp.tool()
     async def delete_checkin(checkin_uuid: str) -> str:
         """Delete a client check-in."""
         resp = await _get_client().delete_checkin(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "delete_checkin")
 
     @mcp.tool()
     async def compare_checkins(checkin_uuid: str) -> str:
         """Compare check-in data over time."""
         resp = await _get_client().compare_checkins(checkin_uuid)
-        return resp.text
+        return _web_payload(resp, "compare_checkins")
 
     @mcp.tool()
     async def checkin_summary(client_uuid: str, client_name: str = "") -> str:
@@ -400,13 +565,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             return _compact({"error": "Could not parse check-in data", "raw": resp.text[:200]})
 
         # Extract check-ins from response
-        checkins: list[dict[str, Any]] = []
-        if isinstance(data, dict):
-            checkins = data.get("checkins", data.get("check_ins", data.get("data", [])))
-            if isinstance(checkins, dict):
-                checkins = checkins.get("checkins", checkins.get("check_ins", []))
-        elif isinstance(data, list):
-            checkins = data
+        checkins = as_dict_list(first_list(data, "checkins", "check_ins", "data"))
 
         if not checkins:
             return _compact(
@@ -433,19 +592,19 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def create_habit(client_uuid: str, title: str) -> str:
         """Create a new habit for a client."""
         resp = await _get_client().create_habit({"client": client_uuid, "title": title})
-        return resp.text
+        return _web_payload(resp, "create_habit")
 
     @mcp.tool()
     async def complete_habit(habit_uuid: str) -> str:
         """Mark a habit as completed."""
         resp = await _get_client().complete_habit({"uuid": habit_uuid})
-        return resp.text
+        return _web_payload(resp, "complete_habit")
 
     @mcp.tool()
     async def list_habits(client_uuid: str, date: str = "") -> str:
         """List habits for a client on a given date."""
         resp = await _get_client().list_habits(client_uuid, date)
-        return resp.text
+        return _web_payload(resp, "list_habits")
 
     # ── Chat ──
 
@@ -453,13 +612,13 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def list_chat_contacts(keyword: str = "") -> str:
         """List clients available for chat, optionally filtered by keyword."""
         resp = await _get_client().get_chat_clients(keyword)
-        return resp.text
+        return _web_payload(resp, "list_chat_contacts")
 
     @mcp.tool()
     async def get_chat_messages(client_uuid: str, last_id: int = 0) -> str:
         """Get chat messages with a client. Use last_id for pagination."""
         resp = await _get_client().get_chat_messages(client_uuid, last_id)
-        return resp.text
+        return _web_payload(resp, "get_chat_messages")
 
     @mcp.tool()
     async def send_chat_message(receiver_uuid: str, message: str) -> str:
@@ -467,7 +626,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         resp = await _get_client().send_chat_message(
             {"receiver_uuid": receiver_uuid, "message": message}
         )
-        return resp.text
+        return _web_payload(resp, "send_chat_message")
 
     # ── Packages ──
 
@@ -475,7 +634,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def manage_package(action: str, package_id: str = "") -> str:
         """Manage coaching packages. Actions: list, view, create, update, delete."""
         resp = await _get_client().package_action(action, package_id)
-        return resp.text
+        return _web_payload(resp, "manage_package")
 
     # ── Calendar ──
 
@@ -483,7 +642,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def delete_calendar_event(event_id: str) -> str:
         """Delete a calendar event."""
         resp = await _get_client().delete_calendar_event(event_id)
-        return resp.text
+        return _web_payload(resp, "delete_calendar_event")
 
     # ── Configuration ──
 
@@ -491,7 +650,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def update_coach_settings(section: str, settings: dict[str, Any]) -> str:
         """Update coach configuration settings for a section."""
         resp = await _get_client().update_configuration(section, settings)
-        return resp.text
+        return _web_payload(resp, "update_coach_settings")
 
     # ── Progress & Charts ──
 
@@ -508,7 +667,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         Range types: week, month, quarter, year, all.
         """
         resp = await _get_client().get_chart_data(client_uuid, metric, range_type, date_range)
-        return resp.text
+        return _web_payload(resp, "get_client_progress")
 
     @mcp.tool()
     async def get_exercise_progress(
@@ -521,7 +680,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         resp = await _get_client().get_chart_by_exercise(
             exercise_name, client_uuid, chart_type, filter_val
         )
-        return resp.text
+        return _web_payload(resp, "get_exercise_progress")
 
     @mcp.tool()
     async def generate_progress_chart(
@@ -547,20 +706,17 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         # Parse chart data from response
         data_points: list[dict[str, Any]] = []
         try:
-            raw = resp.json()
-            if isinstance(raw, list):
-                data_points = raw
-            elif isinstance(raw, dict):
-                data_points = raw.get("data", raw.get("chart_data", []))
-                if isinstance(data_points, dict):
-                    data_points = []
-        except Exception:
-            pass
+            data_points = as_dict_list(first_list(resp.json(), "data", "chart_data"))
+        except ValueError:
+            logger.warning(
+                "Chart data for client %s metric %s was not valid JSON", client_uuid, metric
+            )
 
         # Determine output path
         if not output_path:
-            safe_name = client_name.replace(" ", "_") or client_uuid[:8]
-            output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
+            output_path = _default_output_path(
+                client_name or client_uuid[:8], metric, time_range, suffix=".png"
+            )
 
         # Generate the chart (blocking I/O — run in thread pool)
         png_bytes = await asyncio.to_thread(
@@ -595,7 +751,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     ) -> str:
         """Get the workout log book for an exercise and client."""
         resp = await _get_client().get_workout_log(exercise_id, client_uuid, filter_val)
-        return resp.text
+        return _web_payload(resp, "get_workout_log")
 
     # ── Notifications ──
 
@@ -603,7 +759,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
     async def notify_client(client_uuid: str, action: str) -> str:
         """Send a notification to a client."""
         resp = await _get_client().notify_client(action, client_uuid)
-        return resp.text
+        return _web_payload(resp, "notify_client")
 
     # ── WhatsApp Messaging ──
 
@@ -686,11 +842,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": "Could not fetch clients"})
 
-        clients_list = []
-        if isinstance(data, dict):
-            clients_list = data.get("data", data.get("clients", []))
-        elif isinstance(data, list):
-            clients_list = data
+        clients_list = as_dict_list(first_list(data, "data", "clients"))
 
         if not isinstance(clients_list, list):
             return _compact({"error": "Unexpected client data format"})
@@ -748,11 +900,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR, "raw": resp.text[:200]})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -821,11 +969,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -852,7 +996,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         ics_content = generate_ics(appointments, cal_config)
 
         if not output_path:
-            output_path = f"/tmp/kahunas_appointments_{time_range}.ics"
+            output_path = _default_output_path("appointments", time_range, suffix=".ics")
 
         await asyncio.to_thread(Path(output_path).write_text, ics_content)
 
@@ -900,11 +1044,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -960,11 +1100,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -1024,11 +1160,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         overview = build_appointment_overview(events)
         return _compact(overview)
@@ -1053,11 +1185,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         counts = build_client_appointment_counts(events, client_uuid, client_name)
         return _compact(counts)
@@ -1116,11 +1244,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         except Exception:
             return _compact({"error": _CALENDAR_FETCH_ERROR})
 
-        events = []
-        if isinstance(data, list):
-            events = data
-        elif isinstance(data, dict):
-            events = data.get("data", data.get("events", []))
+        events = as_dict_list(first_list(data, "data", "events"))
 
         # Filter by time range
         try:
@@ -1171,7 +1295,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             if calendar_type == "apple":
                 ics_content = generate_ics(appointments, cal_config)
                 # Save to temp file
-                ics_path = f"/tmp/kahunas_sync_{time_range}.ics"
+                ics_path = _default_output_path("sync", time_range, suffix=".ics")
                 try:
                     with open(ics_path, "w") as f:
                         f.write(ics_content)
@@ -1288,11 +1412,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             try:
                 resp = await _get_client().web_get(_CALENDAR_EVENTS_PATH)
                 data = resp.json()
-                events = []
-                if isinstance(data, list):
-                    events = data
-                elif isinstance(data, dict):
-                    events = data.get("data", data.get("events", []))
+                events = as_dict_list(first_list(data, "data", "events"))
 
                 client_events = []
                 for evt in events:
@@ -1514,13 +1634,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         data_points: list[dict[str, Any]] = []
         try:
-            raw = resp.json()
-            if isinstance(raw, list):
-                data_points = raw
-            elif isinstance(raw, dict):
-                data_points = raw.get("data", raw.get("chart_data", []))
-                if isinstance(data_points, dict):
-                    data_points = []
+            data_points = as_dict_list(first_list(resp.json(), "data", "chart_data"))
         except Exception:
             return _compact({"error": "Could not parse API response"})
 
@@ -1571,8 +1685,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         chart_data = [{"date": p["date"], "value": p["value"]} for p in points]
 
         if not output_path:
-            safe_name = client_name.replace(" ", "_") or client_uuid[:8]
-            output_path = f"/tmp/kahunas_{safe_name}_{metric}_{time_range}.png"
+            output_path = _default_output_path(
+                client_name or client_uuid[:8], metric, time_range, suffix=".png"
+            )
 
         png_bytes = await asyncio.to_thread(
             generate_chart,
@@ -2215,15 +2330,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
             try:
                 ci_resp = await client.list_client_checkins(uuid)
                 ci_data = ci_resp.json()
-                checkins: list[dict[str, Any]] = []
-                if isinstance(ci_data, dict):
-                    checkins = ci_data.get(
-                        "checkins", ci_data.get("check_ins", ci_data.get("data", []))
-                    )
-                    if isinstance(checkins, dict):
-                        checkins = checkins.get("checkins", checkins.get("check_ins", []))
-                elif isinstance(ci_data, list):
-                    checkins = ci_data
+                checkins = as_dict_list(first_list(ci_data, "checkins", "check_ins", "data"))
                 if checkins:
                     ci_result = await asyncio.to_thread(sync.upsert_checkins, uuid, checkins)
                     checkin_total += ci_result["checkins"]
@@ -2237,15 +2344,9 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                     p_resp = await client.get_chart_data(uuid, value=metric, range_type="all")
                     p_data: list[dict[str, Any]] = []
                     try:
-                        raw = p_resp.json()
-                        if isinstance(raw, list):
-                            p_data = raw
-                        elif isinstance(raw, dict):
-                            p_data = raw.get("data", raw.get("chart_data", []))
-                            if isinstance(p_data, dict):
-                                p_data = []
-                    except Exception:
-                        pass
+                        p_data = as_dict_list(first_list(p_resp.json(), "data", "chart_data"))
+                    except ValueError:
+                        logger.warning("Skipping %s progress: response was not JSON", metric)
                     if p_data:
                         progress_total += await asyncio.to_thread(
                             sync.upsert_progress, uuid, metric, p_data
@@ -2347,15 +2448,7 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         try:
             ci_resp = await client.list_client_checkins(client_uuid)
             ci_data = ci_resp.json()
-            checkins: list[dict[str, Any]] = []
-            if isinstance(ci_data, dict):
-                checkins = ci_data.get(
-                    "checkins", ci_data.get("check_ins", ci_data.get("data", []))
-                )
-                if isinstance(checkins, dict):
-                    checkins = checkins.get("checkins", checkins.get("check_ins", []))
-            elif isinstance(ci_data, list):
-                checkins = ci_data
+            checkins = as_dict_list(first_list(ci_data, "checkins", "check_ins", "data"))
             ci_result = await asyncio.to_thread(sync.upsert_checkins, client_uuid, checkins)
             results["checkins"] = ci_result["checkins"]
             results["photos_tracked"] = ci_result["photos"]
@@ -2370,21 +2463,15 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
                 p_resp = await client.get_chart_data(client_uuid, value=metric, range_type="all")
                 p_data: list[dict[str, Any]] = []
                 try:
-                    raw = p_resp.json()
-                    if isinstance(raw, list):
-                        p_data = raw
-                    elif isinstance(raw, dict):
-                        p_data = raw.get("data", raw.get("chart_data", []))
-                        if isinstance(p_data, dict):
-                            p_data = []
-                except Exception:
-                    pass
+                    p_data = as_dict_list(first_list(p_resp.json(), "data", "chart_data"))
+                except ValueError:
+                    logger.warning("Skipping %s progress: response was not JSON", metric)
                 if p_data:
                     progress_total += await asyncio.to_thread(
                         sync.upsert_progress, client_uuid, metric, p_data
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Skipping %s progress for client %s: %s", metric, client_uuid, exc)
         results["progress_points"] = progress_total
 
         # Habits
@@ -2471,12 +2558,8 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
 
         Files are saved to output_dir (default: ~/.kahunas/media/).
         """
-        import httpx as httpx_lib
-
         sync = _get_sync()
-        if not output_dir:
-            output_dir = os.path.expanduser("~/.kahunas/media")
-        media_dir = Path(output_dir)
+        media_dir = Path(output_dir or "~/.kahunas/media").expanduser().resolve()
         media_dir.mkdir(parents=True, exist_ok=True)
 
         results: dict[str, Any] = {"output_dir": str(media_dir)}
@@ -2484,55 +2567,67 @@ def create_server(config: KahunasConfig | None = None) -> FastMCP:
         downloaded_attachments = 0
         errors = 0
 
-        async with httpx_lib.AsyncClient(timeout=30.0) as http:
-            # Download pending photos
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            # Photos. The URL comes from the API, so the fetch is scheme
+            # checked and size capped, and every path segment is sanitised
+            # before it is joined onto the output directory.
             pending_photos = await asyncio.to_thread(sync.get_pending_photos, limit)
             for photo in pending_photos:
                 url = photo["photo_url"]
                 checkin_uuid = photo["checkin_uuid"]
                 client_uuid = photo["client_uuid"]
                 try:
-                    resp = await http.get(url)
-                    if resp.status_code == 200:
-                        # Determine extension from content type or URL
-                        ext = ".jpg"
-                        ct = resp.headers.get("content-type", "")
-                        if "png" in ct:
-                            ext = ".png"
-                        elif "webp" in ct:
-                            ext = ".webp"
+                    fetched = await _download_bounded(http, url)
+                    if fetched is None:
+                        errors += 1
+                        continue
+                    content, content_type = fetched
 
-                        client_dir = media_dir / "photos" / client_uuid[:8]
-                        client_dir.mkdir(parents=True, exist_ok=True)
-                        filename = f"{checkin_uuid[:8]}_{downloaded_photos}{ext}"
-                        local_path = client_dir / filename
-                        await asyncio.to_thread(local_path.write_bytes, resp.content)
-                        await asyncio.to_thread(
-                            sync.mark_photo_downloaded, checkin_uuid, url, str(local_path)
-                        )
-                        downloaded_photos += 1
-                except Exception:
+                    filename = (
+                        f"{safe_filename(checkin_uuid)[:8]}_"
+                        f"{downloaded_photos}{_media_extension(content_type)}"
+                    )
+                    local_path = safe_join(
+                        media_dir, "photos", safe_filename(client_uuid)[:8], filename
+                    )
+                    await asyncio.to_thread(local_path.parent.mkdir, parents=True, exist_ok=True)
+                    await asyncio.to_thread(local_path.write_bytes, content)
+                    await asyncio.to_thread(
+                        sync.mark_photo_downloaded, checkin_uuid, url, str(local_path)
+                    )
+                    downloaded_photos += 1
+                except (OSError, ValueError, httpx.HTTPError) as exc:
+                    logger.warning("Photo download failed for check-in %s: %s", checkin_uuid, exc)
                     errors += 1
 
-            # Download pending attachments
+            # Attachments. file_name is API supplied and was previously
+            # joined verbatim, which allowed a write outside media_dir.
             pending_atts = await asyncio.to_thread(sync.get_pending_attachments, limit)
             for att in pending_atts:
                 url = att["file_url"]
                 parent_uuid = att["parent_uuid"]
                 file_name = att.get("file_name", "")
                 try:
-                    resp = await http.get(url)
-                    if resp.status_code == 200:
-                        att_dir = media_dir / "attachments" / parent_uuid[:8]
-                        att_dir.mkdir(parents=True, exist_ok=True)
-                        safe_name = file_name or f"attachment_{downloaded_attachments}"
-                        local_path = att_dir / safe_name
-                        await asyncio.to_thread(local_path.write_bytes, resp.content)
-                        await asyncio.to_thread(
-                            sync.mark_attachment_downloaded, parent_uuid, url, str(local_path)
-                        )
-                        downloaded_attachments += 1
-                except Exception:
+                    fetched = await _download_bounded(http, url)
+                    if fetched is None:
+                        errors += 1
+                        continue
+                    content, _ = fetched
+
+                    safe_name = safe_filename(
+                        file_name, fallback=f"attachment_{downloaded_attachments}"
+                    )
+                    local_path = safe_join(
+                        media_dir, "attachments", safe_filename(parent_uuid)[:8], safe_name
+                    )
+                    await asyncio.to_thread(local_path.parent.mkdir, parents=True, exist_ok=True)
+                    await asyncio.to_thread(local_path.write_bytes, content)
+                    await asyncio.to_thread(
+                        sync.mark_attachment_downloaded, parent_uuid, url, str(local_path)
+                    )
+                    downloaded_attachments += 1
+                except (OSError, ValueError, httpx.HTTPError) as exc:
+                    logger.warning("Attachment download failed for %s: %s", parent_uuid, exc)
                     errors += 1
 
         results["photos_downloaded"] = downloaded_photos

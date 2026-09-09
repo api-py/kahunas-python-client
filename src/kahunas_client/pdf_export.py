@@ -27,6 +27,12 @@ class PDFExporter(FPDF):
     """Branded PDF exporter with Kahunas header and footer."""
 
     def __init__(self, title: str = "", orientation: str = "P") -> None:
+        """Set up an A4 document with the house margins and page breaks.
+
+        Args:
+            title: Document title rendered in the header.
+            orientation: ``"P"`` for portrait or ``"L"`` for landscape.
+        """
         super().__init__(orientation=orientation, unit="mm", format="A4")
         self._doc_title = title
         self.set_auto_page_break(auto=True, margin=15)

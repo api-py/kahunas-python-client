@@ -5,6 +5,7 @@ class KahunasError(Exception):
     """Base exception for all Kahunas client errors."""
 
     def __init__(self, message: str, code: int | None = None) -> None:
+        """Record the message and the HTTP or API status code, when known."""
         self.code = code
         super().__init__(message)
 
@@ -27,6 +28,7 @@ class ValidationError(KahunasError):
     def __init__(
         self, message: str, errors: list[str] | None = None, code: int | None = None
     ) -> None:
+        """Record the message, per field validation errors, and status code."""
         self.errors = errors or []
         super().__init__(message, code)
 

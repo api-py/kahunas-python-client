@@ -83,11 +83,11 @@ def generate_chart(
     if not dates:
         return _generate_empty_chart(config["label"], time_range, client_name)
 
-    # Sort by date
+    # Sort by date. Rebuilt as new lists rather than reassigning through
+    # zip(*paired), which would swap the element type from list to tuple.
     paired = sorted(zip(dates, values, strict=True), key=lambda x: x[0])
-    dates, values = zip(*paired, strict=True)
-    dates = list(dates)
-    values = list(values)
+    dates = [point_date for point_date, _ in paired]
+    values = [point_value for _, point_value in paired]
 
     # Create the chart
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -96,7 +96,7 @@ def generate_chart(
 
     # Plot line with markers
     ax.plot(
-        dates,
+        dates,  # type: ignore[arg-type]  # matplotlib resolves datetimes via its unit registry
         values,
         color=config["color"],
         linewidth=2,
@@ -109,7 +109,12 @@ def generate_chart(
     )
 
     # Fill area under the line
-    ax.fill_between(dates, values, alpha=0.1, color=config["color"])
+    ax.fill_between(
+        dates,  # type: ignore[arg-type]  # see note on ax.plot above
+        values,
+        alpha=0.1,
+        color=config["color"],
+    )
 
     # Add min/max/latest annotations
     if len(values) >= 2:
@@ -164,10 +169,15 @@ def generate_chart(
 
     fig.tight_layout(rect=(0, 0.03, 1, 1))
 
-    # Export to PNG bytes
+    # Export to PNG bytes. Closing in a finally matters because pyplot keeps
+    # a global reference to every open figure: a rendering failure here would
+    # otherwise leak the figure for the life of the process, and a long lived
+    # MCP server generates charts repeatedly.
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     buf.seek(0)
     png_bytes = buf.read()
 
@@ -231,7 +241,9 @@ def _generate_empty_chart(label: str, time_range: str, client_name: str) -> byte
     ax.set_yticks([])
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    try:
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
     buf.seek(0)
     return buf.read()
