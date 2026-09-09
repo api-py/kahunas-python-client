@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kahunas-client"
-version = "0.1.0"
+# Single source of truth: read from kahunas_client.__version__ so the
+# distribution metadata and the runtime attribute cannot drift apart and
+# ship a wheel that misreports its own version.
+dynamic = ["version"]
 description = "Python client, CLI, and MCP server for the Kahunas fitness API"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -64,6 +67,9 @@ Issues = "https://github.com/api-py/kahunas-python-client/issues"
 [project.scripts]
 kahunas = "kahunas_client.cli.main:cli"
 kahunas-mcp = "kahunas_client.mcp.__main__:main"
+
+[tool.hatch.version]
+path = "src/kahunas_client/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kahunas_client"]

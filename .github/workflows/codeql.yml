@@ -1,0 +1,48 @@
+name: CodeQL
+
+# Static analysis for security and quality defects that lint rules do not
+# model: taint flow from a request into a filesystem path or a query, unsafe
+# deserialisation, and similar whole-program problems. Findings land in the
+# repository's Security tab.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    # Weekly, so a newly published query still finds an idle repository.
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyse:
+    name: Analyse Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Required to upload results to code scanning.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-and-quality adds maintainability and correctness queries
+          # on top of the default security set.
+          queries: security-and-quality
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"

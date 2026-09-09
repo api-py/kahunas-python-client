@@ -5,6 +5,9 @@ on:
     branches: ["main"]
   pull_request:
   workflow_dispatch:
+  # Callable so the release workflow runs this exact gate before publishing.
+  # A release therefore cannot ship code that has not passed CI.
+  workflow_call:
 
 # The workflow only reads the repository. Nothing here publishes, comments,
 # or writes back, so no other scope is granted.

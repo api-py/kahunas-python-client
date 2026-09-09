@@ -26,7 +26,8 @@ Python client library, CLI, and MCP server for the [Kahunas](https://kahunas.io)
 - **Docker & Cloud** — Production-ready Dockerfile for Azure Container Instances, AWS Lambda (container), and Kubernetes, with a `/health` endpoint for orchestrator probes
 - **Configurable Units** — Weight (kg/lbs), height (cm/inches), glucose, food, and water units matching the Kahunas coach configuration page
 - **Auto Re-authentication** — Tokens are automatically refreshed when they expire
-- **Quality Gates** — CI enforces `ruff` (PEP 8, PEP 257, bandit), `mypy --strict`, a coverage floor over 944 tests on Python 3.12 and 3.13, and a `pip-audit` of the locked dependency set
+- **Quality Gates** — CI enforces `ruff` (PEP 8, PEP 257, bandit, unused arguments), `mypy --strict`, a coverage floor over 981 tests on Python 3.12 and 3.13, a `pip-audit` of the locked dependency set, and CodeQL static analysis
+- **Automated Releases** — Tag driven publication to PyPI via trusted publishing, with the full CI gate rerun, tag and version consistency enforced, and signed build provenance on every artefact
 
 ## Requirements
 
@@ -825,15 +826,70 @@ gate is blocking:
 | Tests | Full suite on Python 3.12 and 3.13, against the coverage floor |
 | Audit | `pip-audit` over the locked dependency set |
 | Build | Wheel and sdist, `twine check`, and an isolated install smoke test |
+| Container | Builds the image, then checks `/health` answers and the Lambda dependencies import |
+
+`.github/workflows/codeql.yml` adds CodeQL static analysis on every push
+and pull request, and weekly on a schedule. It runs the
+`security-and-quality` query set, which models whole program problems that
+lint rules cannot: taint flowing from a request into a filesystem path or
+a query, unsafe deserialisation, and similar. Findings appear in the
+repository's Security tab.
 
 Every job installs with `uv sync --locked`, so a dependency change cannot
 land without its lockfile update.
+
+### Releasing
+
+`.github/workflows/release.yml` publishes the package. It is driven by an
+annotated tag, so every published artefact is tied to an immutable commit:
+
+```bash
+# 1. Bump the version. It lives in exactly one place.
+#    src/kahunas_client/__init__.py  ->  __version__ = "0.2.0"
+#    pyproject.toml reads it from there, so the two cannot disagree.
+
+# 2. Commit, tag and push.
+git commit -am "Release 0.2.0"
+git tag -a v0.2.0 -m "Release 0.2.0"
+git push origin main --follow-tags
+```
+
+The workflow then:
+
+1. **Reruns the whole CI gate.** The release calls `ci.yml` as a reusable
+   workflow rather than duplicating it, so a release cannot ship code that
+   has not passed lint, types, tests, audit, build and the container checks.
+2. **Builds and verifies** the wheel and sdist, checks the metadata with
+   `twine check --strict`, and installs the wheel in an isolated
+   environment to confirm it imports and both console scripts resolve.
+3. **Refuses a mismatched tag.** Tagging `v0.2.0` while the package still
+   reports `0.1.0` fails the build rather than publishing an artefact whose
+   name and contents disagree.
+4. **Publishes to PyPI** using trusted publishing. PyPI verifies a
+   short-lived OIDC token from the workflow, so no long-lived API token is
+   stored in the repository.
+5. **Creates the GitHub release** with the artefacts attached and signed
+   build provenance, so a consumer can verify which workflow and commit
+   produced them.
+
+`workflow_dispatch` runs steps 1 and 2 only, which is a safe way to
+rehearse a release without publishing anything.
+
+**One-time setup before the first publish.** Create a
+[PyPI trusted publisher](https://docs.pypi.org/trusted-publishers/) for
+this repository with workflow `release.yml` and environment `pypi`, then
+add a `pypi` environment under repository settings. Protecting that
+environment with a required reviewer gives you a manual approval gate
+before anything reaches the index. Until this is configured the publish
+job is the only thing that fails, and only on a tag: the pull request
+pipeline is unaffected.
 
 ### Standards
 
 The build enforces these rather than relying on convention:
 
 - **PEP 8** layout, naming and import ordering (`ruff` `E`, `W`, `N`, `I`)
+- **Dead parameters and naive datetimes** rejected (`ARG`, `DTZ`), the rules that caught three silently ignored settings
 - **PEP 257** docstrings on every public module, class and function (`D`)
 - **PEP 484** and **PEP 526** typing under `mypy --strict`, with **PEP 561**
   typing information shipped via `py.typed`
